@@ -1,0 +1,1860 @@
+"""
+app.py -- Stock Ledger (GUI)
+
+Uses only the Python standard library (tkinter + sqlite3); nothing to pip install.
+Run:    python app.py
+Build:  run build_exe.bat on Windows to get dist\\StockLedger\\StockLedger.exe (a folder build)
+
+Files:
+  ledger.py   bookkeeping math (cash, positions, average cost, P/L, value over time)
+  storage.py  persistence (SQLite database)
+  quotes.py   live stock quotes and price history (Yahoo Finance)
+  ui.py       look and feel (themes, fonts, custom widgets)
+  app.py      windows and dialogs (this file)
+"""
+
+from __future__ import annotations
+
+import csv
+import os
+import platform
+import queue
+import re
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from datetime import date, datetime
+from decimal import Decimal
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+from i18n import DEFAULT_LANGUAGE, LANGUAGES, language, set_language, tr
+from ledger import (
+    TXN_TYPES,
+    TYPE_FIELDS,
+    ZERO,
+    LedgerError,
+    LedgerResult,
+    Txn,
+    fmt_money,
+    fmt_pct,
+    fmt_price,
+    fmt_qty,
+    parse_date,
+    replay,
+    to_decimal,
+    today,
+    valuation,
+    value_series,
+)
+from quotes import Quote, Suggestion, fetch_quotes, is_crypto, match_local, search_symbols
+from storage import Storage, daily_backup
+from ui import (
+    C,
+    DEFAULT_TEXT_SIZE,
+    TEXT_SIZES,
+    UI,
+    LineChart,
+    PillButton,
+    ScrollFrame,
+    SymbolEntry,
+    TabBar,
+    Toggle,
+    color_for,
+    label,
+    logo,
+    make_tree,
+    round_rect,
+    separator,
+    set_theme,
+    sort_tree,
+    style_menu,
+)
+
+APP_NAME = "Stock Ledger"  # shown through tr(), like all UI text
+APP_VERSION = "2.0"
+LIVE_INTERVAL = 10  # seconds between live price updates
+HISTORY_TTL = 600  # seconds to reuse fetched price history before fetching again
+DAY_SLOTS = 79  # 5-minute bars in a US trading day (+ the close), so today's line fills the chart as the day goes on
+PULSE_FRESH = 20 * 60  # seconds: the 1D chart's dot pulses while its latest price is at most this old (market open)
+
+ALL = "All"  # the "no filter" choice (shown translated)
+# chart range -> (Yahoo range, bar interval, wording for the change line); None = computed / intraday
+RANGES = {
+    "1D": (None, None, "Today"),
+    "1W": ("5d", "30m", "Past week"),
+    "1M": ("1mo", "1d", "Past month"),
+    "3M": ("3mo", "1d", "Past 3 months"),
+    "YTD": ("ytd", "1d", "Year to date"),
+    "1Y": ("1y", "1d", "Past year"),
+    "ALL": (None, None, "All time"),
+}
+
+
+# ======================================================================
+# Paths: during development data lives in a data folder next to the source; in the exe, next to the exe
+# ======================================================================
+def app_dir() -> Path:
+    if getattr(sys, "frozen", False):  # exe built by PyInstaller
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def resource_path(name: str) -> Path:
+    """Location of resources bundled into the exe (e.g. the icon)."""
+    return Path(getattr(sys, "_MEIPASS", app_dir())) / name
+
+
+def data_dir() -> Path:
+    folder = app_dir() / "data"
+    try:
+        folder.mkdir(exist_ok=True)
+        probe = folder / ".write_test"
+        probe.write_text("ok")
+        probe.unlink()
+        return folder
+    except OSError:
+        # if the exe sits somewhere without write access (e.g. Program Files), use the user profile
+        fallback = Path(os.environ.get("APPDATA", Path.home())) / "StockLedger"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def open_folder(path: Path) -> None:
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)  # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        elif "microsoft" in platform.release().lower():  # WSL: open with Windows Explorer
+            win_path = subprocess.check_output(["wslpath", "-w", str(path)], text=True).strip()
+            subprocess.Popen(["explorer.exe", win_path])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception:
+        messagebox.showinfo(tr(APP_NAME), tr("Data folder location:\n{path}", path=path))
+
+
+def saved_language(db: Storage) -> str:
+    """The chosen interface language; Chinese until one is picked."""
+    code = db.get_setting("language")
+    return code if code in LANGUAGES else DEFAULT_LANGUAGE
+
+
+def columns(cols):
+    """Table column specs with translated titles."""
+    return [(key, tr(title), width, anchor) for key, title, width, anchor in cols]
+
+
+def plural(n: str, one: str, many: str) -> str:
+    """tr(one) or tr(many) with {n} filled in; English needs the plural, Chinese does not care."""
+    return tr(one if n == "1" else many, n=n)
+
+
+def holding_text(symbol: str, qty: Decimal) -> str:
+    """'10 shares', or '0.5 coins' for crypto."""
+    n = fmt_qty(qty)
+    return plural(n, "{n} coin", "{n} coins") if is_crypto(symbol) else plural(n, "{n} share", "{n} shares")
+
+
+def symbol_text(t: Txn) -> str:
+    """The symbol column: 'PSKY → NEW' for a symbol change."""
+    return f"{t.symbol} → {t.symbol2}" if t.symbol2 else t.symbol
+
+
+WEEKDAYS_ZH = "一二三四五六日"
+
+
+def text_size(db: Storage) -> str:
+    """The saved text size choice (a key of TEXT_SIZES)."""
+    name = db.get_setting("text_size", DEFAULT_TEXT_SIZE)
+    return name if name in TEXT_SIZES else DEFAULT_TEXT_SIZE
+
+
+def safe_filename(text: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]+', "_", text).strip() or "account"
+
+
+def usd(d: Decimal | float | None, sign: bool = False) -> str:
+    """$1,234.56, -$8.80, or +$27.40 with sign=True."""
+    if d is None:
+        return "-"
+    d = Decimal(str(d))
+    text = fmt_money(abs(d))
+    if text == "0.00":
+        return "$0.00"
+    if d < 0:
+        return "-$" + text
+    return ("+$" if sign else "$") + text
+
+
+def change_text(change, base) -> str:
+    """'+$27.40 (+0.64%)'"""
+    pct = f" ({fmt_pct(Decimal(str(change)) / Decimal(str(base)))})" if base else ""
+    return usd(change, sign=True) + pct
+
+
+def time_label(ts: int, rng: str) -> str:
+    t = datetime.fromtimestamp(ts)
+    if language() == "zh":
+        if rng == "1D":
+            return f"{t:%H:%M}"
+        if rng == "1W":
+            return f"周{WEEKDAYS_ZH[t.weekday()]} {t:%H:%M}"
+        return f"{t.year}年{t.month}月{t.day}日"
+    clock = t.strftime("%I:%M %p").lstrip("0")
+    if rng == "1D":
+        return clock
+    if rng == "1W":
+        return f"{t:%a} {clock}"
+    return f"{t:%b} {t.day}, {t:%Y}"
+
+
+def all_range(first_date: str) -> tuple[str, str]:
+    """Yahoo range/interval covering everything since the first transaction."""
+    days = (date.today() - date.fromisoformat(first_date)).days
+    for limit, rng, interval in ((90, "3mo", "1d"), (365, "1y", "1d"), (730, "2y", "1d"), (1825, "5y", "1wk")):
+        if days <= limit:
+            return rng, interval
+    return "max", "1mo"
+
+
+# ======================================================================
+# Dialog base class
+# ======================================================================
+class Dialog(tk.Toplevel):
+    def __init__(self, parent, title: str):
+        super().__init__(parent, bg=C["bg"])
+        self.withdraw()
+        self.title(title)
+        self.transient(parent)
+        self.resizable(False, False)
+        self.parent = parent
+        self.result = None
+        self.initial_focus = None
+        label(self, title, font=UI.h2).pack(anchor="w", padx=UI.px(20), pady=(UI.px(18), 0))
+        self.body = ttk.Frame(self, padding=(UI.px(20), UI.px(12), UI.px(20), UI.px(16)))
+        self.body.pack(fill="both", expand=True)
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.bind("<Escape>", lambda e: self.cancel())
+
+    def add_buttons(self, ok_text: str | None = None) -> None:
+        bar = tk.Frame(self, bg=C["bg"])
+        bar.pack(fill="x", padx=UI.px(20), pady=(0, UI.px(18)))
+        PillButton(bar, ok_text or tr("Save"), self.ok, "primary").pack(side="right")
+        PillButton(bar, tr("Cancel"), self.cancel, "secondary").pack(side="right", padx=(0, UI.px(8)))
+        # Enter = save (except inside a multi-line text box)
+        self.bind("<Return>", lambda e: None if isinstance(e.widget, tk.Text) else self.ok())
+
+    def show(self, focus=None):
+        self.update_idletasks()
+        p = self.parent.winfo_toplevel()
+        x = p.winfo_rootx() + (p.winfo_width() - self.winfo_reqwidth()) // 2
+        y = p.winfo_rooty() + (p.winfo_height() - self.winfo_reqheight()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.deiconify()
+        self.grab_set()
+        (focus or self.initial_focus or self).focus_set()
+        self.wait_window()
+        return self.result
+
+    def ok(self) -> None:
+        try:
+            result = self.build_result()
+        except ValueError as e:
+            messagebox.showerror(tr("Invalid input"), str(e), parent=self)
+            return
+        if result is None:
+            return
+        self.result = result
+        self.destroy()
+
+    def cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+    def build_result(self):  # implemented by subclasses; returning None keeps the dialog open
+        raise NotImplementedError
+
+
+# ======================================================================
+# Add / edit transaction
+# ======================================================================
+class TxnDialog(Dialog):
+    # English text, translated with tr() when shown
+    AMOUNT_LABELS = {
+        "DEPOSIT": "Deposit amount",
+        "WITHDRAW": "Withdrawal amount",
+        "DIVIDEND": "Dividend amount",
+        "INTEREST": "Interest amount",
+        "FEE": "Fee amount",
+    }
+    HINTS = {
+        "DEPOSIT": "Cash transferred in from a bank (also use this for opening cash).",
+        "WITHDRAW": "Cash transferred out to a bank.",
+        "BUY": "Cash decreases by quantity × price + fee.",
+        "SELL": "Cash increases by quantity × price − fee; realized P/L uses average cost.",
+        "DIVIDEND": "Cash dividend. If it is reinvested, also record a separate Buy.",
+        "INTEREST": "Interest earned on cash (e.g. money market fund income).",
+        "FEE": "Other fees, such as account maintenance or ADR fees.",
+        "SHARES_IN": "Shares transferred in from elsewhere or held at account opening. Does not affect cash.",
+        "SHARES_OUT": "Shares transferred to another account; reduces the position at average cost. Does not affect cash.",
+        "SPLIT": "Enter the change in shares: 10 shares split 4-for-1 become 40, so enter 30. "
+                 "Use a negative number for a reverse split.",
+        "SYMBOL_CHANGE": "Ticker change or merger conversion: the whole position moves to the new symbol with its "
+                         "cost basis (no gain or loss). Enter the new shares received; for 1-for-1, press All.",
+    }
+
+    def __init__(self, parent, title, *, suggest, positions, check, initial: Txn | None = None,
+                 default_type="BUY", default_symbol="", default_date=None):
+        super().__init__(parent, title)
+        self.positions = positions  # {symbol: Position}, for showing current holdings and estimated P/L
+        self.check = check  # whole-ledger check before saving (provided by App)
+        self.initial = initial
+
+        t = initial
+        self.v_date = tk.StringVar(value=t.date if t else (default_date or today()))
+        self.type_by_label = {tr(text): code for code, text in TXN_TYPES.items()}
+        self.v_type = tk.StringVar(value=tr(TXN_TYPES[t.type if t else default_type]))
+        self.v_symbol = tk.StringVar(value=t.symbol if t else default_symbol)
+        self.v_symbol2 = tk.StringVar(value=t.symbol2 if t else "")
+        self.v_qty = tk.StringVar(value=self._num(t.quantity) if t else "")
+        self.v_price = tk.StringVar(value=self._num(t.price) if t else "")
+        self.v_fee = tk.StringVar(value=self._num(t.fee) if t else "")
+        self.v_amount = tk.StringVar(value=self._num(t.amount) if t else "")
+        self.v_note = tk.StringVar(value=t.note if t else "")
+
+        b = self.body
+        pad = {"padx": (0, UI.px(14)), "pady": UI.px(5)}
+        self.rows: dict[str, list[tk.Widget]] = {}
+        self.labels: dict[str, ttk.Label] = {}
+
+        def add_row(key, r, text, widget, extra=None):
+            lbl = ttk.Label(b, text=text, style="Muted.TLabel")
+            lbl.grid(row=r, column=0, sticky="w", **pad)
+            widget.grid(row=r, column=1, sticky="we", pady=UI.px(5))
+            widgets = [lbl, widget]
+            if extra is not None:
+                extra.grid(row=r, column=2, sticky="w", padx=(UI.px(6), 0))
+                widgets.append(extra)
+            self.rows[key] = widgets
+            self.labels[key] = lbl
+
+        add_row("date", 0, tr("Date"), ttk.Entry(b, textvariable=self.v_date, width=24),
+                ttk.Button(b, text=tr("Today"), width=6, command=lambda: self.v_date.set(today())))
+        self.type_box = ttk.Combobox(b, textvariable=self.v_type, values=list(self.type_by_label),
+                                     state="readonly", width=22)
+        add_row("type", 1, tr("Type"), self.type_box)
+        self.symbol_box = SymbolEntry(b, self.v_symbol, suggest, width=24)
+        add_row("symbol", 2, tr("Symbol"), self.symbol_box)
+        self.symbol2_box = SymbolEntry(b, self.v_symbol2, suggest, width=24)
+        add_row("symbol2", 3, tr("New symbol"), self.symbol2_box)
+        self.qty_entry = ttk.Entry(b, textvariable=self.v_qty, width=24, justify="right")
+        self.all_btn = ttk.Button(b, text=tr("All"), width=6, command=self._fill_all)
+        add_row("quantity", 4, tr("Quantity (shares)"), self.qty_entry, self.all_btn)
+        add_row("price", 5, tr("Price"), ttk.Entry(b, textvariable=self.v_price, width=24, justify="right"))
+        add_row("fee", 6, tr("Fee"), ttk.Entry(b, textvariable=self.v_fee, width=24, justify="right"))
+        self.amount_entry = ttk.Entry(b, textvariable=self.v_amount, width=24, justify="right")
+        add_row("amount", 7, tr("Amount"), self.amount_entry)
+        add_row("note", 8, tr("Note"), ttk.Entry(b, textvariable=self.v_note, width=24))
+
+        self.hint = ttk.Label(b, style="Muted.TLabel", wraplength=UI.px(380), justify="left")
+        self.hint.grid(row=9, column=0, columnspan=3, sticky="w", pady=(UI.px(10), 0))
+        self.preview = ttk.Label(b, wraplength=UI.px(380), justify="left")
+        self.preview.grid(row=10, column=0, columnspan=3, sticky="w", pady=(UI.px(6), 0))
+        b.columnconfigure(1, weight=1)
+
+        self.type_box.bind("<<ComboboxSelected>>", lambda e: self._on_type())
+        for box in (self.symbol_box, self.symbol2_box):
+            box.bind("<<SymbolPicked>>", lambda e: e.widget.tk_focusNext().focus_set())
+        for v in (self.v_symbol, self.v_symbol2, self.v_qty, self.v_price, self.v_fee, self.v_amount):
+            v.trace_add("write", lambda *a: self._update_preview())
+        self.add_buttons()
+        self._on_type()
+        self.initial_focus = self.symbol_box if "symbol" in TYPE_FIELDS[self.type_code] else self.amount_entry
+
+    @staticmethod
+    def _num(d: Decimal) -> str:
+        return "" if d == 0 else format(d.normalize(), "f")
+
+    @property
+    def type_code(self) -> str:
+        return self.type_by_label[self.v_type.get()]
+
+    def _on_type(self) -> None:
+        code = self.type_code
+        need = TYPE_FIELDS[code]
+        for key in ("symbol", "symbol2", "quantity", "price", "fee", "amount"):
+            for w in self.rows[key]:
+                w.grid() if key in need else w.grid_remove()
+        if code not in ("SELL", "SHARES_OUT", "SYMBOL_CHANGE"):
+            self.all_btn.grid_remove()
+        self.labels["quantity"].configure(text=tr("Share change" if code == "SPLIT" else
+                                                  "New shares received" if code == "SYMBOL_CHANGE" else
+                                                  "Quantity (shares)"))
+        self.labels["price"].configure(text=tr("Cost per share" if code == "SHARES_IN" else "Price"))
+        self.labels["amount"].configure(text=tr(self.AMOUNT_LABELS.get(code, "Amount")))
+        self.hint.configure(text=tr(self.HINTS[code]) if code in self.HINTS else "")
+        self._update_preview()
+
+    def _fill_all(self) -> None:
+        pos = self.positions.get(self.v_symbol.get().strip().upper())
+        if pos and pos.is_open:
+            self.v_qty.set(format(pos.quantity.normalize(), "f"))
+
+    def _current_txn(self) -> Txn:
+        return Txn(
+            date=parse_date(self.v_date.get()),
+            type=self.type_code,
+            symbol=self.v_symbol.get(),
+            symbol2=self.v_symbol2.get(),
+            quantity=to_decimal(self.v_qty.get()),
+            price=to_decimal(self.v_price.get()),
+            fee=to_decimal(self.v_fee.get()),
+            amount=to_decimal(self.v_amount.get()),
+            note=self.v_note.get(),
+            id=self.initial.id if self.initial else None,
+            account_id=self.initial.account_id if self.initial else None,
+        ).normalized()
+
+    def _update_preview(self) -> None:
+        code = self.type_code
+        lines = []
+        sym = self.v_symbol.get().strip().upper()
+        pos = self.positions.get(sym) if sym else None
+        if code in TYPE_FIELDS and "symbol" in TYPE_FIELDS[code] and sym:
+            if pos and pos.is_open:
+                lines.append(tr("Currently holding {qty} shares of {symbol}, average cost {avg}",
+                                qty=fmt_qty(pos.quantity), symbol=sym, avg=fmt_price(pos.avg_cost)))
+            else:
+                lines.append(tr("No shares of {symbol} currently held", symbol=sym))
+        try:
+            t = Txn(date=today(), type=code, symbol=sym, quantity=to_decimal(self.v_qty.get()),
+                    price=to_decimal(self.v_price.get()), fee=to_decimal(self.v_fee.get()),
+                    amount=to_decimal(self.v_amount.get())).normalized()
+        except ValueError:
+            t = None
+        if t is not None:
+            if code in ("BUY", "SELL") and t.quantity and t.price:
+                lines.append(tr("Trade value {value}", value=fmt_money(t.quantity * t.price)))
+            if t.cash_change:
+                lines.append(tr("Cash change {value}", value=fmt_money(t.cash_change, sign=True)))
+            sym2 = self.v_symbol2.get().strip().upper()
+            if code == "SYMBOL_CHANGE" and pos and pos.is_open and t.quantity and sym2 and sym2 != sym:
+                lines.append(tr("{old_qty} shares of {symbol} become {qty} shares of {new}; cost basis {cost} carries over",
+                                old_qty=fmt_qty(pos.quantity), symbol=sym, qty=fmt_qty(t.quantity), new=sym2,
+                                cost=fmt_money(pos.cost)))
+            if code == "SELL" and pos and pos.is_open and t.quantity and t.price and t.quantity <= pos.quantity:
+                est = t.quantity * t.price - t.fee - pos.avg_cost * t.quantity
+                lines.append(tr("Estimated realized P/L {value}", value=fmt_money(est, sign=True)))
+        self.preview.configure(text="\n".join(lines))
+
+    def build_result(self):
+        t = self._current_txn()
+        t.validate()
+        if not self.check(t, self):
+            return None
+        return t
+
+
+# ======================================================================
+# New / edit account
+# ======================================================================
+class AccountDialog(Dialog):
+    def __init__(self, parent, title, *, suggest, initial=None):
+        super().__init__(parent, title)
+        self.is_new = initial is None
+        self.v_name = tk.StringVar(value=initial["name"] if initial else "")
+        self.v_broker = tk.StringVar(value=initial["broker"] if initial else "Fidelity")
+        self.v_note = tk.StringVar(value=initial["note"] if initial else "")
+        self.v_date = tk.StringVar(value=today())
+        self.v_cash = tk.StringVar()
+
+        b = self.body
+        pad = {"padx": (0, UI.px(14)), "pady": UI.px(5), "sticky": "w"}
+        ttk.Label(b, text=tr("Account name *"), style="Muted.TLabel").grid(row=0, column=0, **pad)
+        self.name_entry = ttk.Entry(b, textvariable=self.v_name, width=34)
+        self.name_entry.grid(row=0, column=1, sticky="we", pady=UI.px(4))
+        ttk.Label(b, text=tr("Broker"), style="Muted.TLabel").grid(row=1, column=0, **pad)
+        ttk.Entry(b, textvariable=self.v_broker, width=34).grid(row=1, column=1, sticky="we", pady=UI.px(4))
+        ttk.Label(b, text=tr("Note"), style="Muted.TLabel").grid(row=2, column=0, **pad)
+        ttk.Entry(b, textvariable=self.v_note, width=34).grid(row=2, column=1, sticky="we", pady=UI.px(4))
+
+        if self.is_new:
+            separator(b).grid(row=3, column=0, columnspan=2, sticky="we", pady=UI.px(14))
+            label(b, tr("Opening balances"), font=UI.bold).grid(row=4, column=0, columnspan=2, sticky="w")
+            ttk.Label(b, text=tr("Optional, can be added later"), style="Muted.TLabel").grid(
+                row=5, column=0, columnspan=2, sticky="w", pady=(0, UI.px(6)))
+            ttk.Label(b, text=tr("Opening date"), style="Muted.TLabel").grid(row=6, column=0, **pad)
+            ttk.Entry(b, textvariable=self.v_date, width=34).grid(row=6, column=1, sticky="we", pady=UI.px(4))
+            ttk.Label(b, text=tr("Opening cash"), style="Muted.TLabel").grid(row=7, column=0, **pad)
+            ttk.Entry(b, textvariable=self.v_cash, width=34, justify="right").grid(row=7, column=1, sticky="we", pady=UI.px(4))
+            ttk.Label(b, text=tr("Opening positions"), style="Muted.TLabel").grid(
+                row=8, column=0, padx=(0, UI.px(14)), pady=(UI.px(22), 0), sticky="nw")
+            self._build_position_editor(b, suggest).grid(row=8, column=1, sticky="we", pady=UI.px(5))
+        b.columnconfigure(1, weight=1)
+        self.add_buttons(tr("Create Account") if self.is_new else None)
+        self.initial_focus = self.name_entry
+
+    # --- opening positions: fill in the cells, press + (or Enter) to add a row to the list
+    def _build_position_editor(self, parent, suggest) -> tk.Frame:
+        ed = tk.Frame(parent, bg=C["bg"])
+        self.v_pos_sym, self.v_pos_qty, self.v_pos_cost = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self.opening_positions: list[tuple[str, Decimal, Decimal]] = []  # (symbol, shares, cost per share)
+        for col, text in enumerate(("SYMBOL", "SHARES", "COST / SHARE")):
+            label(ed, tr(text), font=UI.small_bold, color=C["muted"]).grid(row=0, column=col, sticky="w",
+                                                                     padx=(0, UI.px(6)), pady=(0, UI.px(3)))
+        self.pos_sym_entry = SymbolEntry(ed, self.v_pos_sym, suggest, width=9)
+        entries = (self.pos_sym_entry,
+                   ttk.Entry(ed, textvariable=self.v_pos_qty, width=10, justify="right"),
+                   ttk.Entry(ed, textvariable=self.v_pos_cost, width=11, justify="right"))
+        for col, e in enumerate(entries):
+            e.grid(row=1, column=col, sticky="we", padx=(0, UI.px(6)))
+            e.bind("<Return>", lambda ev: (self._add_position(), "break")[1])  # Enter adds the row, not save
+        self.pos_sym_entry.bind("<<SymbolPicked>>", lambda ev: entries[1].focus_set())
+        PillButton(ed, "+", self._add_position, "primary", font=UI.h2, padx=10, pady=2).grid(row=1, column=3)
+        self.pos_list = ScrollFrame(ed)
+        self.pos_list.grid(row=2, column=0, columnspan=4, sticky="we", pady=(UI.px(10), 0))
+        self.pos_summary = label(ed, "", font=UI.small, color=C["muted"], justify="left", anchor="w")
+        self.pos_summary.grid(row=3, column=0, columnspan=4, sticky="w", pady=(UI.px(6), 0))
+        self._render_positions()
+        return ed
+
+    def _parse_position(self) -> tuple[str, Decimal, Decimal]:
+        t = Txn(date=today(), type="SHARES_IN", symbol=self.v_pos_sym.get(), quantity=to_decimal(self.v_pos_qty.get()),
+                price=to_decimal(self.v_pos_cost.get())).normalized()
+        t.validate()
+        return t.symbol, t.quantity, t.price
+
+    def _add_position(self):
+        try:
+            self.opening_positions.append(self._parse_position())
+        except ValueError as e:
+            messagebox.showerror(tr("Invalid input"), str(e), parent=self)
+            return
+        for v in (self.v_pos_sym, self.v_pos_qty, self.v_pos_cost):
+            v.set("")
+        self._render_positions()
+        self.pos_sym_entry.focus_set()
+
+    def _remove_position(self, index: int):
+        del self.opening_positions[index]
+        self._render_positions()
+
+    def _render_positions(self):
+        inner = self.pos_list.inner
+        for w in inner.winfo_children():
+            w.destroy()
+        for i, (sym, qty, cost) in enumerate(self.opening_positions):
+            pady = UI.px(3)
+            label(inner, sym, font=UI.bold).grid(row=i, column=0, sticky="w", pady=pady)
+            label(inner, holding_text(sym, qty)).grid(row=i, column=1, sticky="e", padx=UI.px(10), pady=pady)
+            label(inner, f"@ {usd(cost)}", color=C["muted"]).grid(row=i, column=2, sticky="e", pady=pady)
+            label(inner, usd(qty * cost)).grid(row=i, column=3, sticky="e", padx=UI.px(10), pady=pady)
+            PillButton(inner, "×", lambda i=i: self._remove_position(i), "ghost", font=UI.h2,
+                       padx=7, pady=0).grid(row=i, column=4, pady=pady)
+        inner.columnconfigure(0, weight=1)
+        inner.columnconfigure(3, weight=1)
+        n = len(self.opening_positions)
+        if n:
+            total = sum((q * c for _, q, c in self.opening_positions), ZERO)
+            self.pos_summary.configure(text=tr("{n} position · {total} total cost" if n == 1 else
+                                               "{n} positions · {total} total cost", n=n, total=usd(total)))
+            inner.update_idletasks()
+            self.pos_list.canvas.configure(height=min(inner.winfo_reqheight(), UI.px(170)))
+            self.pos_list.grid()
+        else:
+            self.pos_summary.configure(text=tr("Fill in the cells and press + (or Enter) to add each stock."))
+            self.pos_list.grid_remove()
+
+    def build_result(self):
+        name = self.v_name.get().strip()
+        if not name:
+            raise ValueError(tr("Please enter an account name"))
+        result = {"name": name, "broker": self.v_broker.get().strip(), "note": self.v_note.get().strip()}
+        if self.is_new:
+            start = parse_date(self.v_date.get())
+            cash = to_decimal(self.v_cash.get())
+            if cash < 0:
+                raise ValueError(tr("Opening cash cannot be negative"))
+            opening = []
+            if cash > 0:
+                opening.append(Txn(date=start, type="DEPOSIT", amount=cash, note=tr("Opening cash")))
+            if any(v.get().strip() for v in (self.v_pos_sym, self.v_pos_qty, self.v_pos_cost)):
+                # a row typed into the cells but not added yet: include it rather than silently dropping it
+                try:
+                    self.opening_positions.append(self._parse_position())
+                except ValueError as e:
+                    raise ValueError(tr("Opening position not added yet: {error}", error=e)) from None
+                for v in (self.v_pos_sym, self.v_pos_qty, self.v_pos_cost):
+                    v.set("")
+                self._render_positions()
+            for sym, qty, cost in self.opening_positions:
+                opening.append(Txn(date=start, type="SHARES_IN", symbol=sym, quantity=qty, price=cost,
+                                   note=tr("Opening position")))
+            result["opening"] = opening
+        return result
+
+
+# ======================================================================
+# Update prices
+# ======================================================================
+class PriceDialog(Dialog):
+    def __init__(self, parent, positions, prices: dict[str, tuple[Decimal, str]], live: bool = False):
+        super().__init__(parent, tr("Update Prices"))
+        b = self.body
+        text = tr("Live prices are on: prices here are replaced automatically for symbols that have a live quote. "
+                  "Use this for holdings without one (e.g. CDs or private funds). Leave blank to clear.") if live else \
+            tr("Live prices are off, so prices are entered by hand. They are used to compute market value "
+               "and unrealized P/L. Leave blank to clear.")
+        ttk.Label(b, style="Muted.TLabel", justify="left", wraplength=UI.px(420), text=text).pack(
+            anchor="w", pady=(0, UI.px(10)))
+
+        scroll = ScrollFrame(b)
+        scroll.pack(fill="both", expand=True)
+        inner = scroll.inner
+        for col, text in enumerate(("SYMBOL", "SHARES", "PRICE", "LAST UPDATED")):
+            label(inner, tr(text), font=UI.small_bold, color=C["muted"]).grid(row=0, column=col, sticky="w",
+                                                                        padx=UI.px(6), pady=UI.px(4))
+        self.vars: dict[str, tk.StringVar] = {}
+        self.first_entry = None
+        for r, p in enumerate(positions, start=1):
+            old = prices.get(p.symbol)
+            var = tk.StringVar(value=format(old[0].normalize(), "f") if old else "")
+            self.vars[p.symbol] = var
+            label(inner, p.symbol, font=UI.bold).grid(row=r, column=0, sticky="w", padx=UI.px(6))
+            label(inner, fmt_qty(p.quantity)).grid(row=r, column=1, sticky="e", padx=UI.px(6))
+            e = ttk.Entry(inner, textvariable=var, width=14, justify="right")
+            e.grid(row=r, column=2, padx=UI.px(6), pady=UI.px(3))
+            self.first_entry = self.first_entry or e
+            label(inner, old[1] if old else "-", color=C["muted"]).grid(row=r, column=3, sticky="w", padx=UI.px(6))
+        inner.update_idletasks()
+        scroll.canvas.configure(width=inner.winfo_reqwidth(), height=min(inner.winfo_reqheight(), UI.px(420)))
+        self.add_buttons()
+        self.initial_focus = self.first_entry
+
+    def build_result(self):
+        result = {}
+        for sym, var in self.vars.items():
+            text = var.get().strip()
+            if text == "":
+                result[sym] = None
+                continue
+            price = to_decimal(text)
+            if price <= 0:
+                raise ValueError(tr("Price for {symbol} must be greater than 0", symbol=sym))
+            result[sym] = price
+        return result
+
+
+# ======================================================================
+# Shared pieces of the main window and the stock page
+# ======================================================================
+class StatGrid(tk.Frame):
+    """Grid of small 'LABEL / value / note' stats."""
+
+    def __init__(self, parent, specs: list[tuple[str, str]], columns: int = 4):
+        super().__init__(parent, bg=C["bg"])
+        self.cells: dict[str, tuple[tk.Label, tk.Label]] = {}
+        for i, (key, title) in enumerate(specs):
+            cell = tk.Frame(self, bg=C["bg"])
+            cell.grid(row=i // columns, column=i % columns, sticky="nw", pady=(0, UI.px(12)))
+            label(cell, title.upper(), font=UI.small_bold, color=C["muted"]).pack(anchor="w")
+            value = label(cell, "-", font=UI.stat)
+            value.pack(anchor="w", pady=(UI.px(2), 0))
+            note = label(cell, "", font=UI.small, color=C["muted"])
+            note.pack(anchor="w")
+            self.cells[key] = (value, note)
+        for c in range(columns):
+            self.columnconfigure(c, weight=1, uniform="stat")
+
+    def set(self, key, value: str, note: str = "", color: str | None = None):
+        v, n = self.cells[key]
+        v.configure(text=value, fg=color or C["text"])
+        n.configure(text=note)
+
+
+class Hero(tk.Frame):
+    """Big number, the change under it, a line chart and range tabs -- the top of a Robinhood page."""
+
+    def __init__(self, parent, title: str, on_range, chart_height=210, slots_1d=DAY_SLOTS):
+        super().__init__(parent, bg=C["bg"])
+        self.title = label(self, title, font=UI.bold, color=C["muted"])
+        self.title.pack(anchor="w")
+        self.value = label(self, "-", font=UI.hero)
+        self.value.pack(anchor="w")
+        row = tk.Frame(self, bg=C["bg"])
+        row.pack(anchor="w", pady=(0, UI.px(8)))
+        self.change = label(row, "", font=UI.bold)
+        self.change.pack(side="left")
+        self.period = label(row, "", font=UI.body, color=C["muted"])
+        self.period.pack(side="left", padx=(UI.px(6), 0))
+        self.chart = LineChart(self, height=UI.px(chart_height), on_hover=self._hover)
+        self.chart.pack(fill="x")
+        self.tabs = TabBar(self, list(RANGES), on_range, font=UI.small_bold, gap=22,
+                           labels={key: tr(key) for key in RANGES})
+        self.tabs.pack(anchor="w", pady=(UI.px(6), 0))
+        self.slots_1d = slots_1d
+        self.rng = "1D"
+        self.points: list[tuple[int, float, float]] = []  # (time, value, net deposits)
+        self.baseline: float | None = None
+        self.now: tuple[str, str, str, str] = ("-", "", "", "")  # value, change, color, period
+
+    def show(self, rng, now_value: str, points, *, baseline=None, now_change=None, now_base=None, message=""):
+        """points: [(unix time, value, net deposits)]; change is measured against `baseline` if given
+        (1D: previous close), otherwise against the first point with deposits/withdrawals taken out."""
+        self.rng = rng
+        self.points = points
+        self.baseline = baseline
+        if now_change is None and len(points) >= 2:
+            now_change, now_base = self._change(len(points) - 1)
+        color = color_for(now_change) if now_change else C["gain"]
+        self.now = (now_value, change_text(now_change, now_base) if now_change is not None else "",
+                    color, tr(RANGES[rng][2]) if now_change is not None else "")
+        # like Robinhood, the end of today's line pulses while prices are coming in
+        live = rng == "1D" and bool(points) and time.time() - points[-1][0] < PULSE_FRESH
+        self.chart.set_data([p[1] for p in points], color=color, baseline=baseline,
+                            labels=[time_label(p[0], rng) for p in points],
+                            slots=self.slots_1d if rng == "1D" else 0, message=message, pulse=live)
+        self.tabs.set_accent(color)
+        self._hover(None)
+
+    def _change(self, i):
+        t, v, n = self.points[i]
+        if self.baseline is not None:
+            return v - self.baseline, self.baseline
+        t0, v0, n0 = self.points[0]
+        flows = n - n0
+        return (v - v0) - flows, (v0 + flows if v0 + flows > 0 else None)
+
+    def _hover(self, i):
+        if i is None:
+            value, change, color, period = self.now
+        else:
+            ch, base = self._change(i)
+            value, change, color, period = usd(self.points[i][1]), change_text(ch, base), color_for(ch), ""
+        self.value.configure(text=value)
+        self.change.configure(text=change, fg=color)
+        self.period.configure(text=period)
+
+
+# ======================================================================
+# Per-stock page
+# ======================================================================
+class SymbolDetail(tk.Toplevel):
+    COLUMNS = [
+        ("date", "Date", 95, "w"), ("type", "Type", 90, "w"), ("qty", "Quantity", 80, "e"),
+        ("price", "Price", 80, "e"), ("fee", "Fee", 65, "e"), ("cash", "Cash Change", 100, "e"),
+        ("hold", "Shares After", 95, "e"), ("avg", "Avg Cost After", 110, "e"),
+        ("realized", "Realized P/L", 100, "e"), ("note", "Note", 140, "w"),
+    ]
+
+    def __init__(self, app: "App", symbol: str):
+        super().__init__(app.root, bg=C["bg"])
+        self.app = app
+        self.symbol = symbol
+        self.history: dict[str, tuple[float, Quote | None]] = {}  # range -> (fetched at, quote with history)
+        self.rng = "1D"
+        self.title(f"{symbol} · {tr(APP_NAME)}")
+        self.geometry(UI.fit(self, 1040, 860))
+        page = tk.Frame(self, bg=C["bg"])
+        page.pack(fill="both", expand=True, padx=UI.px(28), pady=UI.px(20))
+
+        self.hero = Hero(page, symbol, self._on_range, chart_height=230)
+        self.hero.title.configure(font=UI.h1, fg=C["text"])
+        self.hero.pack(fill="x")
+        actions = tk.Frame(page, bg=C["bg"])
+        actions.place(relx=1.0, y=0, anchor="ne")  # top-right corner, over the hero's empty space
+        for code, kind in (("DIVIDEND", "secondary"), ("SELL", "outline"), ("BUY", "primary")):
+            PillButton(actions, tr(TXN_TYPES[code]), lambda c=code: app.add_txn(default_type=c, default_symbol=symbol,
+                                                                            parent=self), kind).pack(
+                side="right", padx=(UI.px(8), 0))
+
+        separator(page).pack(fill="x", pady=UI.px(16))
+        label(page, tr("Your position"), font=UI.h2).pack(anchor="w", pady=(0, UI.px(10)))
+        self.stats = StatGrid(page, [
+            ("shares", tr("Shares")), ("avg", tr("Average cost")), ("value", tr("Market value")),
+            ("cost", tr("Cost basis")), ("day", tr("Today's return")), ("unreal", tr("Total return")),
+            ("realized", tr("Realized P/L")), ("div", tr("Dividends")),
+        ])
+        self.stats.pack(fill="x")
+        separator(page).pack(fill="x", pady=(UI.px(4), UI.px(16)))
+        label(page, tr("History"), font=UI.h2).pack(anchor="w", pady=(0, UI.px(6)))
+        frame, self.tree = make_tree(page, columns(self.COLUMNS))
+        frame.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", self._on_double)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.reload()
+
+    def _close(self):
+        self.app.detail_windows.discard(self)
+        self.destroy()
+
+    def _on_double(self, event):
+        if self.tree.identify_region(event.x, event.y) == "cell" and self.tree.focus():
+            self.app.edit_txn(int(self.tree.focus()), parent=self)
+
+    def _on_range(self, rng):
+        self.rng = rng
+        self.update_chart()
+
+    def update_chart(self):
+        app, sym = self.app, self.symbol
+        q = app.quotes.get(sym)
+        price = app.prices.get(sym)
+        if q and q.name:
+            self.hero.title.configure(text=f"{q.name} ({sym})" if q.name.upper() != sym else sym)
+        now_value = usd(price) if price is not None else "-"
+        if not app.v_live.get():
+            self.hero.show(self.rng, now_value, [], message=tr("Turn on Live prices to see the chart"))
+            return
+        if self.rng == "1D":
+            if not q or len(q.points) < 2:
+                self.hero.show(self.rng, now_value, [], message=tr("Loading…" if app._fetching else "No chart data"))
+                return
+            points = [(t, c, 0.0) for t, c in q.points] + [(int(time.time()), float(q.price), 0.0)]
+            self.hero.show("1D", now_value, points, baseline=float(q.prev_close) if q.prev_close else None)
+            return
+        fetched, hq = self.history.get(self.rng, (0, None))
+        if time.time() - fetched > HISTORY_TTL:
+            if self.rng == "ALL":
+                first = next((r.txn.date for r in app.result.rows if sym in (r.txn.symbol, r.txn.symbol2)), today())
+                yr, iv = all_range(first)
+            else:
+                yr, iv = RANGES[self.rng][:2]
+            rng = self.rng
+            self.history[rng] = (time.time(), hq)  # don't start a second fetch meanwhile
+            app.run_bg(fetch_quotes, ([sym], yr, iv), lambda res: self._got_history(rng, res))
+        if not hq or len(hq.points) < 2:
+            self.hero.show(self.rng, now_value, [], message=tr("Loading…"))
+            return
+        points = [(t, c, 0.0) for t, c in hq.points]
+        if q:
+            points.append((int(time.time()), float(q.price), 0.0))
+        self.hero.show(self.rng, now_value, points)
+
+    def _got_history(self, rng, res):
+        if not self.winfo_exists():
+            return
+        if isinstance(res, Exception):
+            self.history[rng] = (0, None)
+            self.hero.show(rng, self.hero.now[0], [], message=tr("Couldn't load the chart (offline?)"))
+            return
+        self.history[rng] = (time.time(), res.get(self.symbol))
+        if rng == self.rng:
+            self.update_chart()
+
+    def reload(self):
+        res = self.app.result
+        pos = res.positions.get(self.symbol)
+        if pos is None:
+            self._close()
+            return
+        price = self.app.prices.get(self.symbol)
+        q = self.app.quotes.get(self.symbol)
+        st = self.stats
+        st.set("shares", fmt_qty(pos.quantity))
+        st.set("avg", usd(pos.avg_cost) if pos.is_open else "-")
+        st.set("cost", usd(pos.cost) if pos.is_open else "-")
+        if pos.is_open and price is not None:
+            mv = pos.quantity * price
+            st.set("value", usd(mv))
+            st.set("unreal", change_text(mv - pos.cost, pos.cost), color=color_for(mv - pos.cost))
+        else:
+            st.set("value", "-")
+            st.set("unreal", "-")
+        if pos.is_open and q and q.change is not None:
+            day = pos.quantity * q.change
+            st.set("day", change_text(day, pos.quantity * q.prev_close), color=color_for(day))
+        else:
+            st.set("day", "-")
+        st.set("realized", usd(pos.realized, sign=True), color=color_for(pos.realized))
+        st.set("div", usd(pos.dividends))
+        self.update_chart()
+
+        self.tree.delete(*self.tree.get_children())
+        for row in (r for r in reversed(res.rows) if self.symbol in (r.txn.symbol, r.txn.symbol2)):
+            t = row.txn
+            need = TYPE_FIELDS[t.type]
+            moved_out = t.type == "SYMBOL_CHANGE" and t.symbol == self.symbol  # this stock became another one
+            qty_after = ZERO if moved_out else row.qty_after
+            tags = [] if t.type != "SELL" else ["gain" if row.realized > 0 else "loss" if row.realized < 0 else ""]
+            self.tree.insert("", "end", iid=str(t.id), tags=[x for x in tags if x], values=(
+                t.date, f"{t.type_label} ({symbol_text(t)})" if t.symbol2 else t.type_label,
+                fmt_qty(t.quantity, sign=t.type == "SPLIT") if "quantity" in need else "",
+                fmt_price(t.price) if "price" in need else "",
+                fmt_money(t.fee) if t.fee else "",
+                fmt_money(t.cash_change, sign=True) if t.cash_change else "",
+                fmt_qty(qty_after),
+                fmt_price(row.avg_cost_after) if qty_after else "-",
+                fmt_money(row.realized, sign=True) if t.type == "SELL" else "",
+                t.note,
+            ))
+
+
+# ======================================================================
+# Sidebar row: symbol, shares, today's sparkline and a price pill
+# ======================================================================
+class StockRow(tk.Frame):
+    def __init__(self, parent, symbol: str, on_click):
+        super().__init__(parent, bg=C["bg"], cursor="hand2")
+        self.symbol = symbol
+        self.sym_label = label(self, symbol, font=UI.bold)
+        self.sym_label.grid(row=0, column=0, sticky="sw")
+        self.sub = label(self, "", font=UI.small, color=C["muted"])
+        self.sub.grid(row=1, column=0, sticky="nw")
+        self.spark = LineChart(self, height=UI.px(34), width=UI.px(70), interactive=False, pad=2, line_width=1.5)
+        self.spark.grid(row=0, column=1, rowspan=2, padx=UI.px(10))
+        self.pill = tk.Canvas(self, width=UI.px(84), height=UI.px(30), bg=C["bg"], highlightthickness=0, bd=0)
+        self.pill.grid(row=0, column=2, rowspan=2)
+        self.columnconfigure(0, weight=1)
+        for w in (self, self.sym_label, self.sub, self.spark, self.pill):
+            w.bind("<Button-1>", lambda e: on_click(symbol))
+            w.bind("<Enter>", lambda e: self._hover(True))
+            w.bind("<Leave>", lambda e: self._hover(False))
+
+    def _hover(self, on):
+        bg = C["hover"] if on else C["bg"]
+        for w in (self, self.sym_label, self.sub, self.spark, self.pill):
+            w.configure(bg=bg)
+
+    def show(self, pos, quote: Quote | None, price: Decimal | None):
+        self.sub.configure(text=holding_text(pos.symbol, pos.quantity))
+        change = quote.change if quote else None
+        color = color_for(change) if change else C["muted"]
+        if quote and len(quote.points) >= 2:
+            self.spark.set_data([c for _, c in quote.points] + [float(quote.price)], color=color,
+                                baseline=float(quote.prev_close) if quote.prev_close else None, slots=DAY_SLOTS)
+        else:
+            self.spark.set_data([])
+        c = self.pill
+        c.delete("all")
+        w, h = int(c["width"]), int(c["height"])
+        fill = color if change else C["chip"]
+        round_rect(c, 1, 1, w - 1, h - 1, UI.px(6), fill=fill, outline=fill)
+        c.create_text(w / 2, h / 2, text=usd(price) if price is not None else "-", font=UI.small_bold,
+                      fill=C["on_accent"] if change else C["text"])
+
+
+# ======================================================================
+# Symbol type-ahead: feeds the SymbolEntry boxes in the dialogs
+# ======================================================================
+class SymbolSearch:
+    """Called as the user types a symbol. Shows matching symbols from the current account right
+    away (works offline), then adds Yahoo's search results once typing pauses -- only while live
+    prices are on, so turning them off keeps everything you type on this computer."""
+
+    DELAY = 250  # ms of no typing before searching online
+    LIMIT = 8
+
+    def __init__(self, app: "App"):
+        self.app = app
+        self.cache: dict[str, list[Suggestion]] = {}  # query -> results, for this session
+        self.names: dict[str, str] = {}  # symbol -> company name learned from searches
+        self._job = None
+
+    def __call__(self, query: str, show):
+        if self._job:
+            self.app.root.after_cancel(self._job)
+            self._job = None
+        q = query.strip().upper()
+        if q in self.cache:
+            show(query, self._items(q, self.cache[q]))
+            return
+        show(query, self._items(q, []))
+        if q and self.app.v_live.get():
+            self._job = self.app.root.after(self.DELAY, lambda: self._search(query, q, show))
+
+    def _search(self, query, q, show):
+        self._job = None
+        self.app.run_bg(search_symbols, (q, self.LIMIT), lambda res: self._got(query, q, res, show))
+
+    def _got(self, query, q, res, show):
+        if isinstance(res, Exception):
+            return  # offline: the local matches already shown are all we have
+        self.cache[q] = res
+        for s in res:
+            self.names.setdefault(s.symbol, s.name)
+        show(query, self._items(q, res))
+
+    def _name(self, sym: str) -> str:
+        q = self.app.quotes.get(sym)
+        return (q.name if q else "") or self.names.get(sym, "")
+
+    def _items(self, q: str, online: list[Suggestion]) -> list[tuple[str, str, str]]:
+        """Symbols from this account first (with shares held), then online results not already listed."""
+        positions = self.app.result.positions
+        local = match_local(q, {sym: self._name(sym) for sym in positions}, self.LIMIT)
+        local.sort(key=lambda sym: (sym != q, not positions[sym].is_open))  # exact match, then what is still held
+        items = []
+        for sym in local:
+            pos = positions[sym]
+            items.append((sym, self._name(sym), holding_text(sym, pos.quantity) if pos.is_open else tr("Closed")))
+        for s in online:
+            if s.symbol not in local:
+                items.append((s.symbol, s.name, s.exchange or s.kind))
+        return items[: self.LIMIT]
+
+
+# ======================================================================
+# Main window
+# ======================================================================
+class App:
+    HOLD_COLUMNS = [
+        ("symbol", "Symbol", 80, "w"), ("qty", "Shares", 85, "e"), ("avg", "Avg Cost", 90, "e"),
+        ("cost", "Cost Basis", 105, "e"), ("price", "Price", 85, "e"), ("day", "Day Change", 135, "e"),
+        ("value", "Market Value", 105, "e"),
+        ("unreal", "Unrealized P/L", 110, "e"), ("pct", "P/L %", 75, "e"),
+        ("realized", "Realized P/L", 100, "e"), ("div", "Dividends", 85, "e"),
+    ]
+    TXN_COLUMNS = [
+        ("date", "Date", 95, "w"), ("type", "Type", 90, "w"), ("symbol", "Symbol", 70, "w"),
+        ("qty", "Quantity", 80, "e"), ("price", "Price", 80, "e"), ("fee", "Fee", 65, "e"),
+        ("cash", "Cash Change", 105, "e"), ("balance", "Cash Balance", 110, "e"), ("note", "Note", 160, "w"),
+    ]
+
+    def __init__(self, root: tk.Tk, db: Storage, folder: Path):
+        self.root = root
+        self.db = db
+        self.folder = folder
+        self.accounts: list[sqlite3.Row] = []
+        self.account_id: int | None = None
+        self.txns: list[Txn] = []
+        self.result = LedgerResult()
+        self.prices: dict[str, Decimal] = {}
+        self.price_info: dict[str, tuple[Decimal, str]] = {}
+        self.quotes: dict[str, Quote] = {}  # live quotes (with today's intraday prices) fetched this session
+        self.history: dict[tuple, tuple[float, dict[str, Quote] | None]] = {}  # chart data per range
+        self._bg_queue: queue.Queue = queue.Queue()  # results from background threads
+        self._fetching = False
+        self._live_job = None
+        self.detail_windows: set[SymbolDetail] = set()
+        self.symbol_search = SymbolSearch(self)
+        self.stock_rows: dict[str, StockRow] = {}
+        self.last_date: str | None = None
+        self.last_type = "BUY"
+        self.range = "1D"
+
+        self.v_show_closed = tk.BooleanVar(value=False)
+        self.v_filter_symbol = tk.StringVar(value=tr(ALL))
+        self.v_filter_type = tk.StringVar(value=tr(ALL))
+        self.v_live = tk.BooleanVar(value=db.get_setting("live_prices", "1") == "1")
+        self.v_dark = tk.BooleanVar(value=db.get_setting("theme", "dark") == "dark")
+        self.v_text_size = tk.StringVar(value=text_size(db))
+        self.v_language = tk.StringVar(value=language())
+        for v in (self.v_filter_symbol, self.v_filter_type):
+            v.trace_add("write", lambda *a: self.refresh_txn_list())
+
+        root.title(tr(APP_NAME))
+        root.geometry(UI.fit(root, 1320, 920))
+        root.minsize(min(UI.px(1000), root.winfo_screenwidth()), min(UI.px(640), root.winfo_screenheight()))
+        self._build_ui()
+        root.bind_all("<Control-n>", lambda e: self.add_txn())
+        root.bind_all("<F5>", lambda e: self.refresh())
+        root.protocol("WM_DELETE_WINDOW", self.quit)
+
+        last = self.db.get_setting("last_account")
+        self.load_accounts(select_id=int(last) if last and last.isdigit() else None)
+        if not self.accounts:
+            root.after(300, self.first_run)
+        self._poll_bg()
+        if self.v_live.get():
+            self._live_tick()
+
+    # ------------------------------------------------------------ UI construction
+    def _build_ui(self):
+        self._build_topbar()
+        self.status = label(self.root, "", font=UI.small, color=C["muted"], anchor="w")
+        self.status.pack(side="bottom", fill="x", padx=UI.px(28), pady=(0, UI.px(8)))
+        body = tk.Frame(self.root, bg=C["bg"])
+        body.pack(fill="both", expand=True, padx=UI.px(28), pady=(UI.px(18), UI.px(8)))
+        self._build_sidebar(body)
+        main = tk.Frame(body, bg=C["bg"])
+        main.pack(side="left", fill="both", expand=True)
+        self.hero = Hero(main, tr("Total assets"), self._on_range)
+        self.hero.pack(fill="x")
+        self.hero.tabs.select(self.range)
+        separator(main).pack(fill="x", pady=(UI.px(10), UI.px(14)))
+        self.stats = StatGrid(main, [
+            ("cash", tr("Cash")), ("value", tr("Market value")), ("cost", tr("Cost basis")),
+            ("unreal", tr("Unrealized P/L")), ("realized", tr("Realized P/L")), ("income", tr("Dividends + interest")),
+            ("net", tr("Net deposits")), ("fees", tr("Fees & commissions")),
+        ])
+        self.stats.pack(fill="x")
+        self._build_tabs(main)
+
+    def _build_topbar(self):
+        bar = tk.Frame(self.root, bg=C["bg"])
+        bar.pack(fill="x", padx=UI.px(28), pady=(UI.px(14), UI.px(10)))
+        logo(bar, tr(APP_NAME)).pack(side="left")
+        self.account_btn = PillButton(bar, tr("No account"), self._account_menu, "secondary", padx=14, pady=6, caret=True)
+        self.account_btn.pack(side="left", padx=(UI.px(20), 0))
+
+        self.more_btn = PillButton(bar, "", self._more_menu, "ghost", padx=10, pady=6, icon="more")
+        self.more_btn.pack(side="right")
+        PillButton(bar, tr("+ Add transaction"), self.add_txn, "primary", padx=16, pady=6).pack(
+            side="right", padx=(UI.px(8), UI.px(4)))
+        PillButton(bar, tr("Update prices"), self.update_prices, "secondary", padx=14, pady=6).pack(side="right")
+        live = tk.Frame(bar, bg=C["bg"])
+        live.pack(side="right", padx=UI.px(16))
+        self.live_status = label(live, "", font=UI.small, color=C["muted"])
+        self.live_status.pack(side="left", padx=(0, UI.px(10)))
+        label(live, tr("Live"), font=UI.small_bold, color=C["muted"]).pack(side="left", padx=(0, UI.px(6)))
+        Toggle(live, self.v_live, self.toggle_live).pack(side="left")
+        separator(self.root).pack(fill="x")
+
+    def _build_sidebar(self, body):
+        side = tk.Frame(body, bg=C["bg"], highlightthickness=1, highlightbackground=C["border"],
+                        width=UI.px(310))
+        side.pack(side="right", fill="y", padx=(UI.px(28), 0))
+        side.pack_propagate(False)
+        head = tk.Frame(side, bg=C["bg"])
+        head.pack(fill="x", padx=UI.px(16), pady=(UI.px(14), UI.px(8)))
+        label(head, tr("Stocks"), font=UI.h2).pack(side="left")
+        self.side_count = label(head, "", font=UI.small, color=C["muted"])
+        self.side_count.pack(side="right")
+        separator(side).pack(fill="x")
+        self.side_list = ScrollFrame(side)
+        self.side_list.pack(fill="both", expand=True, padx=UI.px(6), pady=UI.px(6))
+        self.side_empty = label(self.side_list.inner, tr("No holdings yet"), color=C["muted"])
+        self.stock_rows = {}
+
+    def _build_tabs(self, main):
+        separator(main).pack(fill="x", pady=(0, UI.px(12)))
+        head = tk.Frame(main, bg=C["bg"])
+        head.pack(fill="x")
+        self.pages: dict[str, tk.Frame] = {}
+        self.page_tabs = TabBar(head, ["Holdings", "Transactions"], self._show_page, font=UI.h2, gap=26,
+                                labels={"Holdings": tr("Holdings"), "Transactions": tr("Transactions")})
+        self.page_tabs.pack(side="left")
+        tools = tk.Frame(head, bg=C["bg"])
+        tools.pack(side="right", fill="x")
+        stack = tk.Frame(main, bg=C["bg"])
+        stack.pack(fill="both", expand=True, pady=(UI.px(8), 0))
+
+        # --- Holdings ---
+        page = tk.Frame(stack, bg=C["bg"])
+        self.pages["Holdings"] = page
+        bar = tk.Frame(page, bg=C["bg"])
+        bar.pack(fill="x", pady=(0, UI.px(6)))
+        label(bar, tr("Double-click a stock to open its page"), font=UI.small, color=C["muted"]).pack(side="left")
+        PillButton(bar, tr("View details"), self.open_selected_symbol, "secondary", font=UI.small_bold,
+                   padx=12, pady=4).pack(side="right")
+        Toggle(bar, self.v_show_closed, self.refresh_holdings).pack(side="right", padx=(UI.px(6), UI.px(16)))
+        label(bar, tr("Show closed"), font=UI.small, color=C["muted"]).pack(side="right")
+        frame, self.hold_tree = make_tree(page, columns(self.HOLD_COLUMNS))
+        frame.pack(fill="both", expand=True)
+        self.hold_tree.bind("<Double-1>", self._on_hold_double)
+
+        # --- Transactions ---
+        page = tk.Frame(stack, bg=C["bg"])
+        self.pages["Transactions"] = page
+        bar = tk.Frame(page, bg=C["bg"])
+        bar.pack(fill="x", pady=(0, UI.px(6)))
+        label(bar, tr("Symbol"), font=UI.small, color=C["muted"]).pack(side="left")
+        self.filter_symbol_box = ttk.Combobox(bar, textvariable=self.v_filter_symbol, state="readonly", width=10)
+        self.filter_symbol_box.pack(side="left", padx=(UI.px(6), UI.px(14)))
+        label(bar, tr("Type"), font=UI.small, color=C["muted"]).pack(side="left")
+        ttk.Combobox(bar, textvariable=self.v_filter_type, state="readonly", width=12,
+                     values=[tr(ALL), *(tr(text) for text in TXN_TYPES.values())]).pack(side="left", padx=UI.px(6))
+        PillButton(bar, tr("Clear"), self._clear_filters, "ghost", font=UI.small_bold, padx=10, pady=4).pack(
+            side="left", padx=UI.px(6))
+        PillButton(bar, tr("Delete"), self.delete_selected_txn, "secondary", font=UI.small_bold, padx=12, pady=4).pack(
+            side="right")
+        PillButton(bar, tr("Edit"), self.edit_selected_txn, "secondary", font=UI.small_bold, padx=12, pady=4).pack(
+            side="right", padx=UI.px(6))
+        self.txn_count = label(bar, "", font=UI.small, color=C["muted"])
+        self.txn_count.pack(side="right", padx=UI.px(12))
+        frame, self.txn_tree = make_tree(page, columns(self.TXN_COLUMNS))
+        frame.pack(fill="both", expand=True)
+        self.txn_tree.bind("<Double-1>", self._on_txn_double)
+        self.txn_tree.bind("<Return>", lambda e: self.edit_selected_txn())
+        self.txn_tree.bind("<Delete>", lambda e: self.delete_selected_txn())
+        self._show_page("Holdings")
+
+    def _show_page(self, name):
+        for key, page in self.pages.items():
+            if key == name:
+                page.pack(fill="both", expand=True)
+            else:
+                page.pack_forget()
+
+    def _popup(self, menu: tk.Menu, widget: tk.Widget):
+        menu.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height() + UI.px(4))
+
+    def _account_menu(self):
+        m = style_menu(tk.Menu(self.root, tearoff=False))
+        current = tk.IntVar(value=self.account_id or 0)
+        for a in self.accounts:
+            m.add_radiobutton(label=a["name"], variable=current, value=a["id"],
+                              command=lambda i=a["id"]: self._select_account(i))
+        if self.accounts:
+            m.add_separator()
+        m.add_command(label=tr("New account…"), command=self.new_account)
+        m.add_command(label=tr("Edit account…"), command=self.edit_account)
+        m.add_command(label=tr("Delete account…"), command=self.delete_account)
+        self._popup(m, self.account_btn)
+
+    def _more_menu(self):
+        m = style_menu(tk.Menu(self.root, tearoff=False))
+        m.add_command(label=tr("Add transaction"), accelerator="Ctrl+N", command=self.add_txn)
+        m.add_command(label=tr("Update prices…"), command=self.update_prices)
+        m.add_separator()
+        m.add_command(label=tr("Export current account to CSV…"), command=self.export_csv)
+        m.add_command(label=tr("Back up database…"), command=self.backup)
+        m.add_command(label=tr("Open data folder"), command=lambda: open_folder(self.folder))
+        m.add_separator()
+        m.add_checkbutton(label=tr("Dark mode"), variable=self.v_dark, command=self.toggle_theme)
+        sizes = style_menu(tk.Menu(m, tearoff=False))
+        for name in TEXT_SIZES:
+            sizes.add_radiobutton(label=tr(name), value=name, variable=self.v_text_size, command=self.change_text_size)
+        m.add_cascade(label=tr("Text size"), menu=sizes)
+        langs = style_menu(tk.Menu(m, tearoff=False))
+        for code, name in LANGUAGES.items():
+            langs.add_radiobutton(label=name, value=code, variable=self.v_language, command=self.change_language)
+        m.add_cascade(label="Language / 语言", menu=langs)  # in both languages, so it can always be found
+        m.add_separator()
+        m.add_command(label=tr("User guide"), command=self.show_help)
+        m.add_command(label=tr("About"), command=self.show_about)
+        m.add_separator()
+        m.add_command(label=tr("Exit"), command=self.quit)
+        self._popup(m, self.more_btn)
+
+    def toggle_theme(self):
+        self.db.set_setting("theme", "dark" if self.v_dark.get() else "light")
+        self.rebuild()
+
+    def change_text_size(self):
+        self.db.set_setting("text_size", self.v_text_size.get())
+        self.rebuild()
+
+    def change_language(self):
+        self.db.set_setting("language", self.v_language.get())
+        set_language(self.v_language.get())
+        self.v_filter_symbol.set(tr(ALL))  # the filters hold the old language's "All"
+        self.v_filter_type.set(tr(ALL))
+        self.rebuild()
+
+    def rebuild(self):
+        """Apply a new theme, text size or language: rebuild every widget with the new colors, fonts and text."""
+        for w in list(self.detail_windows):
+            w.destroy()
+        self.detail_windows.clear()
+        for child in self.root.winfo_children():
+            child.destroy()
+        set_theme("dark" if self.v_dark.get() else "light")
+        UI.setup(self.root, TEXT_SIZES[self.v_text_size.get()], cjk=language() == "zh")
+        self.root.title(tr(APP_NAME))
+        self._build_ui()
+        self.load_accounts(select_id=self.account_id)
+
+    # ------------------------------------------------------------ Accounts
+    def load_accounts(self, select_id: int | None = None):
+        self.accounts = self.db.list_accounts()
+        ids = [a["id"] for a in self.accounts]
+        if select_id not in ids:
+            select_id = ids[0] if ids else None
+        self._select_account(select_id)
+
+    def _select_account(self, account_id):
+        if account_id != self.account_id:
+            self.v_filter_symbol.set(tr(ALL))
+        self.account_id = account_id
+        acc = self.current_account()
+        self.account_btn.set_text(acc["name"] if acc else tr("No account"))
+        self.refresh()
+
+    def current_account(self):
+        return next((a for a in self.accounts if a["id"] == self.account_id), None)
+
+    def require_account(self) -> bool:
+        if self.account_id is None:
+            if messagebox.askyesno(tr(APP_NAME), tr("There are no accounts yet. Create one now?")):
+                self.new_account()
+            return self.account_id is not None
+        return True
+
+    def first_run(self):
+        messagebox.showinfo(tr(APP_NAME), tr("Welcome! Start by creating an account and entering its opening cash and positions "
+                                             "(both optional; you can add them later)."))
+        self.new_account()
+
+    def new_account(self):
+        data = AccountDialog(self.root, tr("New Account"), suggest=self.symbol_search).show()
+        if not data:
+            return
+        try:
+            new_id = self.db.create_account(data["name"], data["broker"], data["note"], data["opening"])
+        except sqlite3.IntegrityError:
+            messagebox.showerror(tr(APP_NAME), tr('An account named "{name}" already exists. Please choose another name.',
+                                                  name=data["name"]))
+            return
+        self.load_accounts(select_id=new_id)
+
+    def edit_account(self):
+        acc = self.current_account()
+        if not acc:
+            return
+        data = AccountDialog(self.root, tr("Edit Account"), suggest=self.symbol_search, initial=acc).show()
+        if not data:
+            return
+        try:
+            self.db.update_account(acc["id"], data["name"], data["broker"], data["note"])
+        except sqlite3.IntegrityError:
+            messagebox.showerror(tr(APP_NAME), tr('An account named "{name}" already exists.', name=data["name"]))
+            return
+        self.load_accounts(select_id=acc["id"])
+
+    def delete_account(self):
+        acc = self.current_account()
+        if not acc:
+            return
+        if not messagebox.askyesno(
+            tr("Delete Account"),
+            tr('Delete the account "{name}" and its {n} transactions?\n\n'
+               "This cannot be undone (daily automatic backups are in the data\\backups folder).",
+               name=acc["name"], n=len(self.txns)),
+            icon="warning",
+        ):
+            return
+        self.db.delete_account(acc["id"])
+        self.account_id = None
+        self.load_accounts()
+
+    # ------------------------------------------------------------ Transactions
+    def _check_txn(self, t: Txn, parent) -> bool:
+        """Before saving, replay the full history with the new transaction to make sure nothing conflicts."""
+        others = [x for x in self.txns if x.id != t.id]
+        try:
+            res = replay(others + [t])
+        except LedgerError as e:
+            messagebox.showerror(tr("Cannot Save"), tr("Saving this would make the books inconsistent:\n{error}", error=e),
+                                 parent=parent)
+            return False
+        if t.cash_change < 0:
+            idx = next(i for i, r in enumerate(res.rows) if r.txn is t)
+            low = min(r.cash_after for r in res.rows[idx:])
+            if low < 0 and not messagebox.askyesno(
+                tr("Insufficient Cash"),
+                tr("After this transaction the cash balance goes negative (lowest {low}).\n"
+                   "If this is margin or a deposit you have not recorded yet, you can still save. Save anyway?",
+                   low=fmt_money(low)),
+                parent=parent, icon="warning",
+            ):
+                return False
+        return True
+
+    def _positions_without(self, txn_id: int | None):
+        """When editing a transaction, the position hints should exclude that transaction itself."""
+        if txn_id is None:
+            return self.result.positions
+        try:
+            return replay([x for x in self.txns if x.id != txn_id]).positions
+        except LedgerError:
+            return self.result.positions
+
+    def add_txn(self, default_type: str | None = None, default_symbol: str = "", parent=None):
+        if self.root.grab_current() is not None or not self.require_account():
+            return
+        t = TxnDialog(parent or self.root, tr("Add Transaction"), suggest=self.symbol_search, positions=self.result.positions,
+                      check=self._check_txn, default_type=default_type or self.last_type,
+                      default_symbol=default_symbol, default_date=self.last_date).show()
+        if not t:
+            return
+        t.account_id = self.account_id
+        self.db.add_txn(t)
+        self.last_date, self.last_type = t.date, t.type
+        self.refresh(select_txn=t.id)
+
+    def edit_txn(self, txn_id: int, parent=None):
+        old = next((x for x in self.txns if x.id == txn_id), None)
+        if not old:
+            return
+        t = TxnDialog(parent or self.root, tr("Edit Transaction"), suggest=self.symbol_search, positions=self._positions_without(txn_id),
+                      check=self._check_txn, initial=old).show()
+        if not t:
+            return
+        self.db.update_txn(t)
+        self.refresh(select_txn=t.id)
+
+    def edit_selected_txn(self):
+        sel = self.txn_tree.focus()
+        if sel:
+            self.edit_txn(int(sel))
+        else:
+            messagebox.showinfo(tr(APP_NAME), tr("Please select a transaction in the Transactions tab first."))
+
+    def delete_selected_txn(self):
+        sel = self.txn_tree.focus()
+        if not sel:
+            messagebox.showinfo(tr(APP_NAME), tr("Please select a transaction in the Transactions tab first."))
+            return
+        t = next(x for x in self.txns if x.id == int(sel))
+        desc = f"{t.date}  {t.type_label}  {t.symbol}  {fmt_money(t.cash_change, sign=True) if t.cash_change else ''}"
+        try:
+            replay([x for x in self.txns if x.id != t.id])
+        except LedgerError as e:
+            messagebox.showerror(tr("Cannot Delete"), tr("Deleting this would make the books inconsistent:\n{error}\n\n"
+                                                        "Edit or delete the later related transactions first.", error=e))
+            return
+        if messagebox.askyesno(tr("Delete Transaction"), tr("Delete this transaction?\n\n{desc}", desc=desc)):
+            self.db.delete_txn(t.id)
+            self.refresh()
+
+    def _on_txn_double(self, event):
+        if self.txn_tree.identify_region(event.x, event.y) == "cell" and self.txn_tree.focus():
+            self.edit_txn(int(self.txn_tree.focus()))
+
+    def _clear_filters(self):
+        self.v_filter_symbol.set(tr(ALL))
+        self.v_filter_type.set(tr(ALL))
+
+    # ------------------------------------------------------------ Holdings
+    def _on_hold_double(self, event):
+        if self.hold_tree.identify_region(event.x, event.y) == "cell":
+            self.open_symbol(self.hold_tree.focus())
+
+    def open_selected_symbol(self):
+        sym = self.hold_tree.focus()
+        if not sym:
+            messagebox.showinfo(tr(APP_NAME), tr("Please select a stock first."))
+            return
+        self.open_symbol(sym)
+
+    def open_symbol(self, sym: str):
+        if not sym:
+            return
+        for w in self.detail_windows:
+            if w.symbol == sym:
+                w.deiconify()
+                w.lift()
+                w.focus_set()
+                return
+        self.detail_windows.add(SymbolDetail(self, sym))
+
+    def update_prices(self):
+        if not self.require_account():
+            return
+        positions = self.result.open_positions
+        if not positions:
+            messagebox.showinfo(tr(APP_NAME), tr("The current account has no open positions."))
+            return
+        data = PriceDialog(self.root, positions, self.price_info, live=self.v_live.get()).show()
+        if data is None:
+            return
+        self.db.set_prices(data)
+        self.refresh()
+
+    # ------------------------------------------------------------ Background work and live prices
+    def run_bg(self, fn, args, done):
+        """Run fn(*args) in a background thread; done(result or exception) is then called on the UI thread."""
+        def work():
+            try:
+                res = fn(*args)
+            except Exception as e:  # handed to `done`, which decides what to show
+                res = e
+            self._bg_queue.put((done, res))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_bg(self):
+        try:
+            while True:
+                done, res = self._bg_queue.get_nowait()
+                try:
+                    done(res)
+                except tk.TclError:
+                    pass  # the window it was meant for was closed meanwhile
+        except queue.Empty:
+            pass
+        self.root.after(150, self._poll_bg)
+
+    def toggle_live(self):
+        self.db.set_setting("live_prices", "1" if self.v_live.get() else "0")
+        if self._live_job:
+            self.root.after_cancel(self._live_job)
+            self._live_job = None
+        if self.v_live.get():
+            self._live_tick()
+        else:
+            self.quotes.clear()
+            self.live_status.configure(text="", fg=C["muted"])
+        self.refresh_view()
+
+    def _live_tick(self):
+        self._live_job = None
+        if not self.v_live.get():
+            return
+        self._fetch_quotes()
+        self._live_job = self.root.after(LIVE_INTERVAL * 1000, self._live_tick)
+
+    def _fetch_quotes(self):
+        symbols = [p.symbol for p in self.result.open_positions]
+        if self._fetching or not symbols:
+            return
+        self._fetching = True
+        self.run_bg(fetch_quotes, (symbols,), lambda res: self._apply_quotes(symbols, res))
+
+    def _apply_quotes(self, symbols, got):
+        self._fetching = False
+        if not self.v_live.get():
+            return
+        if isinstance(got, Exception):
+            self.live_status.configure(text=tr("Offline, retrying…"), fg=C["loss"])
+            return
+        self.quotes.update(got)
+        # save prices that changed, so the last known price is still there when offline
+        changed = {s: q.price for s, q in got.items() if self.prices.get(s) != q.price}
+        if changed:
+            self.db.set_prices(changed)
+            self.price_info.update({s: (price, today()) for s, price in changed.items()})
+            self.prices.update(changed)
+        missing = [s for s in symbols if s not in got]
+        note = tr(" · no quote: {symbols}", symbols=", ".join(missing)) if missing else ""
+        self.live_status.configure(text=tr("Updated {time}", time=f"{datetime.now():%H:%M:%S}") + note, fg=C["muted"])
+        self.refresh_view()
+
+    def _day_change(self) -> tuple[Decimal, Decimal]:
+        """Today's change in value of the holdings that have a live quote, and their value at yesterday's close."""
+        change = base = ZERO
+        for p in self.result.open_positions:
+            q = self.quotes.get(p.symbol)
+            if q and q.change is not None:
+                change += p.quantity * q.change
+                base += p.quantity * q.prev_close
+        return change, base
+
+    # ------------------------------------------------------------ Chart
+    def _on_range(self, rng):
+        self.range = rng
+        self.refresh_chart()
+
+    def refresh_chart(self):
+        r = self.result
+        total = r.cash + valuation(r, self.prices).market_value
+        now = usd(total) if self.account_id is not None else "-"
+        hero = self.hero
+        if self.account_id is None or not r.rows:
+            hero.show(self.range, now, [], message=tr("No transactions yet"))
+            return
+        if not self.v_live.get():
+            hero.show(self.range, now, [], message=tr("Turn on Live prices to see the chart"))
+            return
+        fallback = self.prices
+        end = (int(time.time()), float(total), float(r.net_deposits))
+        if self.range == "1D":
+            series = {s: q.points for s, q in self.quotes.items() if s in r.positions and q.points}
+            if not series:
+                msg = tr("Loading…" if self._fetching else ("No chart data" if r.open_positions else "No holdings"))
+                hero.show("1D", now, [], message=msg)
+                return
+            day, _ = self._day_change()
+            points = [(p.time, p.value, p.net_deposits) for p in value_series(r.rows, series, fallback)] + [end]
+            prev = float(total - day)
+            hero.show("1D", now, points, baseline=prev, now_change=float(day), now_base=prev)
+            return
+        if self.range == "ALL":
+            yr, iv = all_range(r.rows[0].txn.date)
+        else:
+            yr, iv = RANGES[self.range][:2]
+        symbols = tuple(sorted(r.positions))
+        key = (yr, iv, symbols)
+        fetched, data = self.history.get(key, (0, None))
+        if time.time() - fetched > HISTORY_TTL:
+            self.history[key] = (time.time(), data)  # don't start a second fetch meanwhile
+            self.run_bg(fetch_quotes, (list(symbols), yr, iv), lambda res: self._got_history(key, res))
+        if data is None:
+            hero.show(self.range, now, [], message=tr("Loading…"))
+            return
+        series = {s: q.points for s, q in data.items() if q.points}
+        points = [(p.time, p.value, p.net_deposits) for p in value_series(r.rows, series, fallback)] + [end]
+        hero.show(self.range, now, points)
+
+    def _got_history(self, key, res):
+        if isinstance(res, Exception):
+            self.history[key] = (0, None)
+            self.hero.show(self.range, self.hero.now[0], [], message=tr("Couldn't load the chart (offline?)"))
+            return
+        self.history[key] = (time.time(), res)
+        self.refresh_chart()
+
+    # ------------------------------------------------------------ Refresh
+    def refresh(self, select_txn: int | None = None):
+        if self.account_id is not None:
+            self.txns = self.db.list_txns(self.account_id)
+            try:
+                self.result = replay(self.txns)
+            except LedgerError as e:  # only happens if the database was edited by hand
+                messagebox.showerror(tr(APP_NAME), tr("Error replaying the ledger: {error}", error=e))
+                self.result = LedgerResult()
+        else:
+            self.txns, self.result = [], LedgerResult()
+        self.price_info = self.db.get_prices()
+        self.prices = {s: p for s, (p, _) in self.price_info.items()}
+
+        symbols = [tr(ALL), *sorted({s for t in self.txns for s in (t.symbol, t.symbol2) if s})]
+        self.filter_symbol_box.configure(values=symbols)
+        if self.v_filter_symbol.get() not in symbols:
+            self.v_filter_symbol.set(tr(ALL))
+        self.refresh_view()
+        self.refresh_txn_list(select_txn)
+
+        acc = self.current_account()
+        if acc:
+            broker = f" · {acc['broker']}" if acc["broker"] else ""
+            note = f" · {acc['note']}" if acc["note"] else ""
+            self.status.configure(text=f"{acc['name']}{broker}{note} · {tr('{n} transactions', n=len(self.txns))}"
+                                       f"        {tr('Data file: {path}', path=self.db.path)}")
+        else:
+            self.status.configure(text=tr("Data file: {path}", path=self.db.path))
+        if self.v_live.get() and any(p.symbol not in self.quotes for p in self.result.open_positions):
+            self._fetch_quotes()  # new account or new stock: don't wait for the next tick
+
+    def refresh_view(self):
+        """Redraw everything that depends on prices."""
+        self.refresh_chart()
+        self.refresh_stats()
+        self.refresh_sidebar()
+        self.refresh_holdings()
+        for w in list(self.detail_windows):
+            w.reload()
+
+    def refresh_stats(self):
+        r = self.result
+        st = self.stats
+        if self.account_id is None:
+            for key in st.cells:
+                st.set(key, "-")
+            return
+        v = valuation(r, self.prices)
+        total = r.cash + v.market_value
+        st.set("cash", usd(r.cash), tr("{pct}% of total", pct=f"{r.cash / total * 100:.1f}") if total > 0 else "",
+               C["loss"] if r.cash < 0 else None)
+        n_open = len(r.open_positions)
+        if v.missing:
+            note = tr("{symbols} etc. at cost" if len(v.missing) > 2 else "{symbols} at cost",
+                      symbols=", ".join(v.missing[:2]))
+        else:
+            note = plural(str(n_open), "{n} stock", "{n} stocks")
+        st.set("value", usd(v.market_value), note)
+        st.set("cost", usd(r.total_cost), tr("Incl. commissions"))
+        priced = n_open - len(v.missing)
+        if priced:
+            priced_cost = sum((p.cost for p in r.open_positions if p.symbol in self.prices), ZERO)
+            st.set("unreal", usd(v.unrealized, sign=True),
+                   fmt_pct(v.unrealized / priced_cost) if priced_cost else "", color_for(v.unrealized))
+        else:
+            st.set("unreal", "-", tr("Needs prices"))
+        st.set("realized", usd(r.realized, sign=True), "", color_for(r.realized))
+        st.set("income", usd(r.dividends + r.interest),
+               tr("Div {div} · Int {int}", div=fmt_money(r.dividends), int=fmt_money(r.interest)))
+        st.set("net", usd(r.net_deposits), tr("In {deposits} · Out {withdrawals}", deposits=fmt_money(r.deposits),
+                                              withdrawals=fmt_money(r.withdrawals)))
+        st.set("fees", usd(r.fees))
+
+    def refresh_sidebar(self):
+        positions = self.result.open_positions
+        syms = [p.symbol for p in positions]
+        if list(self.stock_rows) != syms:  # holdings changed: rebuild the rows
+            for row in self.stock_rows.values():
+                row.destroy()
+            self.stock_rows = {}
+            for s in syms:
+                row = StockRow(self.side_list.inner, s, self.open_symbol)
+                row.pack(fill="x", padx=UI.px(10), pady=UI.px(6))
+                self.stock_rows[s] = row
+        if syms:
+            self.side_empty.pack_forget()
+        else:
+            self.side_empty.pack(pady=UI.px(20))
+        for p in positions:
+            self.stock_rows[p.symbol].show(p, self.quotes.get(p.symbol), self.prices.get(p.symbol))
+        self.side_count.configure(text=plural(str(len(syms)), "{n} holding", "{n} holdings") if syms else "")
+
+    def refresh_holdings(self):
+        tree = self.hold_tree
+        selected = tree.focus()
+        scroll = tree.yview()[0]
+        tree.delete(*tree.get_children())
+        tree.hover_row = ""
+        positions = self.result.all_positions if self.v_show_closed.get() else self.result.open_positions
+        for p in positions:
+            price = self.prices.get(p.symbol)
+            mv = unreal = pct = None
+            if p.is_open and price is not None:
+                mv = p.quantity * price
+                unreal = mv - p.cost
+                pct = unreal / p.cost if p.cost else None
+            q = self.quotes.get(p.symbol) if p.is_open else None
+            day = "-"
+            if q and q.change is not None:
+                day = f"{fmt_money(p.quantity * q.change, sign=True)} ({fmt_pct(q.change / q.prev_close)})"
+            tags = [] if p.is_open else ["muted"]
+            tree.insert("", "end", iid=p.symbol, tags=tags, values=(
+                p.symbol,
+                fmt_qty(p.quantity),
+                fmt_price(p.avg_cost) if p.is_open else "-",
+                fmt_money(p.cost) if p.is_open else "-",
+                fmt_price(price) if (price is not None and p.is_open) else "-",
+                day,
+                fmt_money(mv),
+                fmt_money(unreal, sign=True) if unreal is not None else "-",
+                fmt_pct(pct),
+                fmt_money(p.realized, sign=True),
+                fmt_money(p.dividends),
+            ))
+        if tree.sort_state:  # keep the user's column sort across live updates
+            sort_tree(tree, *next(iter(tree.sort_state.items())))
+        if selected and tree.exists(selected):
+            tree.selection_set(selected)
+            tree.focus(selected)
+        tree.yview_moveto(scroll)
+
+    def refresh_txn_list(self, select_txn: int | None = None):
+        tree = self.txn_tree
+        keep = select_txn or (int(tree.focus()) if tree.focus() else None)
+        tree.delete(*tree.get_children())
+        tree.hover_row = ""
+        sym = self.v_filter_symbol.get()
+        typ = self.v_filter_type.get()
+        shown = 0
+        for row in reversed(self.result.rows):  # newest first
+            t = row.txn
+            if sym != tr(ALL) and sym not in (t.symbol, t.symbol2):
+                continue
+            if typ != tr(ALL) and t.type_label != typ:
+                continue
+            need = TYPE_FIELDS[t.type]
+            tree.insert("", "end", iid=str(t.id), values=(
+                t.date,
+                t.type_label,
+                symbol_text(t),
+                fmt_qty(t.quantity, sign=t.type == "SPLIT") if "quantity" in need else "",
+                fmt_price(t.price) if "price" in need else "",
+                fmt_money(t.fee) if t.fee else "",
+                fmt_money(t.cash_change, sign=True) if t.cash_change else "-",
+                fmt_money(row.cash_after),
+                t.note,
+            ))
+            shown += 1
+        total = len(self.result.rows)
+        self.txn_count.configure(text=tr("Showing {shown} of {total}", shown=shown, total=total) if shown != total
+                                 else tr("{total} total", total=total))
+        if keep and tree.exists(str(keep)):
+            tree.selection_set(str(keep))
+            tree.focus(str(keep))
+            tree.see(str(keep))
+
+    # ------------------------------------------------------------ File
+    def export_csv(self):
+        acc = self.current_account()
+        if not acc:
+            return
+        folder = filedialog.askdirectory(title=tr("Choose a folder to export to"))
+        if not folder:
+            return
+        stamp = datetime.now().strftime("%Y%m%d")
+        base = safe_filename(acc["name"])
+        txn_file = Path(folder) / f"{base}_transactions_{stamp}.csv"
+        hold_file = Path(folder) / f"{base}_holdings_{stamp}.csv"
+        # utf-8-sig: lets Excel display non-ASCII text (e.g. notes) correctly
+        with open(txn_file, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow([tr(h) for h in ("Date", "Type", "Symbol", "Quantity", "Price", "Fee", "Amount", "Cash Change",
+                                        "Cash Balance", "Note", "New Symbol")])
+            for row in self.result.rows:
+                t = row.txn
+                w.writerow([t.date, t.type_label, t.symbol, format(t.quantity, "f"), format(t.price, "f"),
+                            format(t.fee, "f"), format(t.amount, "f"), fmt_money(t.cash_change).replace(",", ""),
+                            fmt_money(row.cash_after).replace(",", ""), t.note, t.symbol2])
+        with open(hold_file, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow([tr(h) for h in ("Symbol", "Shares", "Avg Cost", "Cost Basis", "Price", "Market Value",
+                                        "Realized P/L", "Dividends")])
+            for p in self.result.all_positions:
+                price = self.prices.get(p.symbol)
+                mv = p.quantity * price if (price is not None and p.is_open) else None
+                w.writerow([p.symbol, format(p.quantity, "f"), fmt_price(p.avg_cost).replace(",", ""),
+                            fmt_money(p.cost).replace(",", ""), format(price, "f") if price is not None else "",
+                            fmt_money(mv).replace(",", "") if mv is not None else "",
+                            fmt_money(p.realized).replace(",", ""), fmt_money(p.dividends).replace(",", "")])
+            w.writerow([])
+            w.writerow([tr("Cash Balance"), fmt_money(self.result.cash).replace(",", "")])
+        messagebox.showinfo(tr(APP_NAME), tr("Exported:\n{files}", files=f"{txn_file.name}\n{hold_file.name}"))
+
+    def backup(self):
+        path = filedialog.asksaveasfilename(
+            title=tr("Back Up Database"), defaultextension=".db",
+            initialfile=f"stock_ledger_backup_{datetime.now():%Y%m%d_%H%M}.db",
+            filetypes=[(tr("SQLite database"), "*.db"), (tr("All files"), "*.*")],
+        )
+        if path:
+            self.db.backup_to(path)
+            messagebox.showinfo(tr(APP_NAME), tr("Backup complete:\n{path}", path=path))
+
+    def show_help(self):
+        messagebox.showinfo(tr("User Guide"), tr(
+            "1. When creating an account you can enter opening cash and positions.\n"
+            "2. For every buy, sell, dividend, deposit or withdrawal, click \"+ Add transaction\" (Ctrl+N).\n"
+            "   In the Symbol box, type a ticker or a company name and pick from the list.\n"
+            "3. Cash balance, shares, average cost and P/L are all calculated from the transactions.\n"
+            "   To fix a mistake, double-click it in the Transactions tab, or select it and press Delete.\n"
+            "4. With \"Live\" on, prices update every {seconds} seconds from Yahoo Finance.\n"
+            "   Turn it off to work offline and enter prices by hand with \"Update prices\".\n"
+            "5. Hover over the chart to see your total assets at any point; pick a range below it.\n"
+            "   Changes for ranges other than 1D leave out deposits and withdrawals.\n"
+            "6. Click a stock in the Stocks list for its own page with chart and history.\n"
+            "7. Dividend reinvestment: record a Dividend, then a Buy.\n"
+            "8. Stock split: record a Split with the number of shares added (total cost is unchanged).\n"
+            "9. Cost basis uses the average cost method.\n\n"
+            "Data is stored in:\n{path}\nIt is backed up to the backups folder the first time you open the app each day.",
+            seconds=LIVE_INTERVAL, path=self.db.path,
+        ))
+
+    def show_about(self):
+        messagebox.showinfo(tr("About"), tr(
+            "{app} {version}\n\nA local bookkeeping tool. Your data stays on your own computer;\n"
+            "only stock symbols (and what you type into a symbol box) are sent to Yahoo Finance\n"
+            "for live prices and suggestions.", app=tr(APP_NAME), version=APP_VERSION))
+
+    def quit(self):
+        if self.account_id is not None:
+            self.db.set_setting("last_account", str(self.account_id))
+        self.db.close()
+        self.root.destroy()
+
+
+# ======================================================================
+def main():
+    if sys.platform == "win32":
+        try:  # crisp text on high-DPI screens
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
+    folder = data_dir()
+    db_path = folder / "stock_ledger.db"
+    try:
+        daily_backup(db_path, folder / "backups")
+    except Exception:
+        pass  # a failed backup should not block the app
+
+    db = Storage(db_path)
+    set_language(saved_language(db))
+    set_theme(db.get_setting("theme", "dark"))
+    root = tk.Tk()
+    if sys.platform == "win32":
+        try:
+            root.iconbitmap(default=str(resource_path("icon.ico")))
+        except tk.TclError:
+            pass
+    UI.setup(root, TEXT_SIZES[text_size(db)], cjk=language() == "zh")
+    App(root, db, folder)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
