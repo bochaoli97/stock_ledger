@@ -23,6 +23,9 @@ from ledger import (
     LedgerResult,
     Position,
     Txn,
+    ValuePoint,
+    combine_results,
+    combine_series,
     fmt_money,
     fmt_pct,
     fmt_price,
@@ -364,6 +367,40 @@ def test_distribution_checks():
     raises(ValueError, distribution(10, qty=0).validate, match="Quantity must be greater than 0")
     assert distribution(10, fee=D(1), amount=D(2)).normalized().price == 10  # the percent is kept
     raises(LedgerError, replay, [distribution(10, id=1)], match="no shares held at the time of the distribution")
+
+
+def test_combine_results_adds_accounts_up():
+    one = replay(txns(
+        ("2026-01-02", "DEPOSIT", "", 0, 0, 0, 1000),
+        ("2026-01-05", "BUY", "X", 10, 10, 1, 0),  # cash 899, X: 10 shares cost 101
+        ("2026-01-06", "DIVIDEND", "X", 0, 0, 0, 5),
+        ("2026-01-07", "INTEREST", "", 0, 0, 0, 2),
+    ))
+    two = replay(txns(
+        ("2026-01-03", "DEPOSIT", "", 0, 0, 0, 500),
+        ("2026-01-04", "BUY", "X", 30, 20, 0, 0),
+        ("2026-01-04", "BUY", "Y", 1, 100, 0, 0),
+        ("2026-02-01", "SELL", "X", 10, 25, 2, 0),  # cost out 200, realized 250 - 2 - 200 = 48; 20 shares cost 400 left
+        ("2026-02-02", "WITHDRAW", "", 0, 0, 0, 50),
+    ))
+    total = combine_results([one, two])
+    assert total.cash == 906 + -2 and (total.deposits, total.withdrawals, total.interest, total.fees) == (1500, 50, 2, 3)
+    x = total.positions["X"]  # held in both accounts: one position, average cost = total cost / total shares
+    assert (x.quantity, x.cost, x.realized, x.dividends) == (30, 501, 48, 5) and x.avg_cost == D("16.7")
+    assert total.positions["Y"].quantity == 1 and [p.symbol for p in total.open_positions] == ["X", "Y"]
+    assert total.net_deposits == 1450 and total.realized == 48 and total.total_cost == 601
+    assert len(total.rows) == 9 and [r.txn.date for r in total.rows] == sorted(r.txn.date for r in total.rows)
+    assert one.positions["X"].quantity == 10 and two.positions["X"].quantity == 20  # the accounts are left alone
+    empty = combine_results([])
+    assert empty.cash == 0 and not empty.positions and not empty.rows
+
+
+def test_combine_series_adds_accounts_up():
+    first = [ValuePoint(1, 10.0, 10.0), ValuePoint(2, 11.0, 10.0), ValuePoint(3, 12.0, 10.0)]
+    later = [ValuePoint(2, 5.0, 4.0), ValuePoint(3, 6.0, 4.0)]  # opened after the first point: adds nothing before that
+    out = combine_series([first, later])
+    assert [(p.time, p.value, p.net_deposits) for p in out] == [(1, 10, 10), (2, 16, 14), (3, 18, 14)]
+    assert first[1].value == 11.0 and combine_series([]) == []  # inputs untouched
 
 
 def test_crypto_amounts():
@@ -1152,6 +1189,67 @@ def test_pages_scroll_up_and_down_when_the_window_is_short():
         _close_gui(root)
 
 
+def test_all_accounts_view():
+    from types import SimpleNamespace
+    from unittest import mock
+
+    import app
+
+    win = _gui_window()
+    if win is None:
+        return
+    root, a = win
+    try:
+        first = a.account_id
+        assert a.account_btn.text == "Test" and list(a.page_tabs.items) == ["Holdings", "Transactions"]
+        a.load_accounts(select_id=app.ALL_ACCOUNTS)  # one account only: the combined view is not offered
+        assert a.account_id == first and not a.combined
+        second = a.db.create_account("Second")
+        for kw in (dict(date="2026-02-01", type="DEPOSIT", amount=D(5000)),
+                   dict(date="2026-02-02", type="BUY", symbol="SKYD", quantity=D(500), price=D(12))):
+            a.db.add_txn(Txn(account_id=second, **kw))
+        a.db.set_prices({"SKYD": D(11), "AAPL": D(155)})
+        a.load_accounts(select_id=app.ALL_ACCOUNTS)
+        root.update()
+        assert a.combined and a.account_btn.text == i18n.tr("All accounts")
+        assert list(a.page_tabs.items) == ["Accounts", "Holdings"] and a.pages["Accounts"].winfo_ismapped()
+        assert a.hero.title.cget("text") == "Net worth (all accounts)"
+        # one position per stock across both accounts, cash and totals added up
+        assert a.result.positions["SKYD"].quantity == 1500 and a.result.cash == (20000 - 10000 - 1500) + (5000 - 6000)
+        rows = [a.acct_tree.item(i, "values") for i in a.acct_tree.get_children()]
+        assert [r[0] for r in rows] == ["Test", "Second"]
+        assert rows[1][1:4] == ("-1,000.00", "5,500.00", "4,500.00")  # cash, market value, total of the second account
+        assert a.stats.cells["cash"][0].cget("text") == "$7,500.00"
+        # it is read-only: no adding, and the stock page lists transactions of both accounts with their account
+        with mock.patch.object(app.messagebox, "showinfo") as info:
+            a.add_txn()
+            assert info.called and "Choose one account" in info.call_args[0][1]
+        a.open_symbol("SKYD")
+        root.update()
+        d = a.detail
+        assert d.combined and d.tree.heading(d.tree["columns"][0], "text") == "ACCOUNT"
+        assert [d.tree.item(i, "values")[0] for i in d.tree.get_children()] == ["Second", "Test"]
+        row = d.tree.get_children()[0]
+        d.tree.focus(row)
+        x, y, _, _ = d.tree.bbox(row, 0)
+        with mock.patch.object(app.App, "edit_txn") as edit:
+            d._on_double(SimpleNamespace(x=x + 3, y=y + 3))
+            assert not edit.called  # no editing from the combined view
+        a._select_account(first)  # picking one account leaves the stock page and brings back its own tabs
+        root.update()
+        assert a.detail is None and not a.combined and list(a.page_tabs.items) == ["Holdings", "Transactions"]
+        assert a.hero.title.cget("text") == "Total assets"
+        # drill down from the accounts table
+        a._select_account(app.ALL_ACCOUNTS)
+        root.update()
+        a.acct_tree.focus(str(second))
+        x, y, _, _ = a.acct_tree.bbox(str(second), 0)
+        a._on_account_double(SimpleNamespace(x=x + 3, y=y + 3))  # double-click the account's row
+        assert a.account_id == second and not a.combined
+    finally:
+        _close_gui(root)
+
+
 def test_reset_filters_button_only_shows_while_filtering():
     win = _gui_window()
     if win is None:
@@ -1209,7 +1307,8 @@ def _translated_texts() -> set[str]:
                     found |= {e.value for e in it.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)}
     found |= set(TXN_TYPES.values())
     found |= set(app.RANGES) | {wording for _, _, wording in app.RANGES.values()}
-    for cols in (app.App.HOLD_COLUMNS, app.App.TXN_COLUMNS, app.SymbolDetail.COLUMNS):
+    for cols in (app.App.HOLD_COLUMNS, app.App.TXN_COLUMNS, app.App.ACCOUNT_COLUMNS, app.SymbolDetail.COLUMNS,
+                 [app.SymbolDetail.ACCOUNT_COLUMN]):
         found |= {title for _, title, _, _ in cols}
     found |= set(app.TxnDialog.AMOUNT_LABELS.values()) | set(app.TxnDialog.HINTS.values()) | {"Amount"}
     found |= set(ui.TEXT_SIZES) | {app.APP_NAME, app.ALL, "Holdings", "Transactions"}

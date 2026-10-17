@@ -14,6 +14,8 @@ symbol box, to suggest matching stocks (both can be turned off).
   today's sparkline and price for every holding
 
 - Multiple accounts (e.g. a Fidelity individual account and a Roth IRA); opening cash and positions can be entered when creating one
+- **All accounts** view: with two or more accounts, add them up into one net worth, with a per-account table
+  and holdings merged across accounts
 - Transaction types: Deposit, Withdrawal, Buy, Sell, Dividend, Interest, Fee, Shares In, Shares Out, Split, Symbol Change, Distribution
 - Crypto as well as stocks: record bitcoin as `BTC-USD` (ether `ETH-USD`, …), with amounts down to 0.00000001
 - Automatic calculation of cash balance (with the running balance after every transaction), shares held, average cost, cost basis, realized P/L and total dividends
@@ -156,6 +158,10 @@ new ones, and leave the `data` folder alone. (Rebuilding never touches a `data` 
 - 1D compares with the previous close (the dotted line). Other ranges show the gain or loss over the period
   with deposits and withdrawals left out, so adding cash doesn't count as a return.
 - Past values are rebuilt from your transactions and Yahoo's daily closes. Splits you've recorded are taken into account.
+- With two or more accounts, **All accounts** at the top of the account menu adds them up: net worth and chart, an
+  **Accounts** tab with each account's cash, market value, share of the total and P/L (double-click one to open it),
+  and **Holdings** merged by symbol (a stock held in two accounts is one row; average cost = total cost / total shares).
+  This view is read-only: to add or edit transactions, pick one account. All amounts are in dollars; there is no currency conversion.
 - Click a stock in the **Stocks** list (or double-click it in Holdings) to open its own page in place of the overview,
   with a price chart, your position and its transaction history. Click another stock in the list to switch to it;
   **Back** or `Esc` returns to the overview.

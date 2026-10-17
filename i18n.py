@@ -42,6 +42,8 @@ ZH: dict[str, str] = {
     "Updated {time}": "更新于 {time}",
     " · no quote: {symbols}": " · 无报价：{symbols}",
     "Total assets": "总资产",
+    "Net worth (all accounts)": "净资产（全部账户）",
+    "All accounts": "全部账户",
     "Stocks": "股票",
     "No holdings yet": "暂无持仓",
     "{n} holding": "{n} 只持仓",
@@ -90,6 +92,12 @@ ZH: dict[str, str] = {
     "No holdings": "没有持仓",
     "Couldn't load the chart (offline?)": "图表加载失败（是否离线？）",
     # ---- tabs and tables
+    "Accounts": "账户",
+    "Account": "账户",
+    "Total": "合计",
+    "% of Total": "占比",
+    "Net Deposits": "净入金",
+    "Double-click an account to open it": "双击账户可打开它",
     "Holdings": "持仓",
     "Transactions": "交易记录",
     "Double-click a stock to open its page": "双击股票打开详情页",
@@ -279,6 +287,10 @@ ZH: dict[str, str] = {
     "The current account has no open positions.": "当前账户没有持仓。",
     "Error replaying the ledger: {error}": "重算账本时出错：{error}",
     "{n} transactions": "{n} 笔交易",
+    "{n} account": "{n} 个账户",
+    "{n} accounts": "{n} 个账户",
+    "This is the combined view of all accounts. Choose one account to add a transaction.":
+        "这是全部账户的汇总视图。请先选择一个账户，再添加交易。",
     "Data file: {path}": "数据文件：{path}",
     "Choose a folder to export to": "选择导出到的文件夹",
     "Exported:\n{files}": "已导出：\n{files}",
@@ -299,7 +311,8 @@ ZH: dict[str, str] = {
     "6. Click a stock in the Stocks list for its own page with chart and history.\n"
     "7. Dividend reinvestment: record a Dividend, then a Buy.\n"
     "8. Stock split: record a Split with the number of shares added (total cost is unchanged).\n"
-    "9. Cost basis uses the average cost method.\n\n"
+    "9. Cost basis uses the average cost method.\n"
+    "10. With two or more accounts, \"All accounts\" in the account menu adds them up (read-only).\n\n"
     "Data is stored in:\n{path}\nIt is backed up to the backups folder the first time you open the app each day.":
         "1. 创建账户时可以填写期初现金和持仓。\n"
         "2. 每次买入、卖出、收到股息、存入或取出资金，都点“+ 添加交易”（Ctrl+N）记一笔。\n"
@@ -313,7 +326,8 @@ ZH: dict[str, str] = {
         "6. 点击“股票”列表中的股票，可打开它的详情页，查看图表和历史记录。\n"
         "7. 股息再投资：先记一笔股息，再记一笔买入。\n"
         "8. 拆股：记一笔拆股，填写增加的股数（总成本不变）。\n"
-        "9. 持仓成本按平均成本法计算。\n\n"
+        "9. 持仓成本按平均成本法计算。\n"
+        "10. 有两个或更多账户时，账户菜单里的“全部账户”会把它们加在一起显示（只读）。\n\n"
         "数据保存在：\n{path}\n每天第一次打开软件时会自动备份到 backups 文件夹。",
     "{app} {version}\n\nA local bookkeeping tool. Your data stays on your own computer;\n"
     "only stock symbols (and what you type into a symbol box) are sent to Yahoo Finance\n"

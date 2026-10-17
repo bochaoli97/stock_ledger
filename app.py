@@ -39,6 +39,8 @@ from ledger import (
     LedgerError,
     LedgerResult,
     Txn,
+    combine_results,
+    combine_series,
     fmt_money,
     fmt_pct,
     fmt_price,
@@ -83,6 +85,7 @@ DAY_SLOTS = 79  # 5-minute bars in a US trading day (+ the close), so today's li
 PULSE_FRESH = 20 * 60  # seconds: the 1D chart's dot pulses while its latest price is at most this old (market open)
 
 ALL = "All"  # the "no filter" choice (shown translated)
+ALL_ACCOUNTS = -1  # account_id of the combined view of every account (read-only)
 # chart range -> (Yahoo range, bar interval, wording for the change line); None = computed / intraday
 RANGES = {
     "1D": (None, None, "Today"),
@@ -775,11 +778,13 @@ class SymbolDetail(PageScroll):
         ("hold", "Shares After", 95, "e"), ("avg", "Avg Cost After", 110, "e"),
         ("realized", "Realized P/L", 100, "e"), ("note", "Note", 140, "w"),
     ]
+    ACCOUNT_COLUMN = ("account", "Account", 110, "w")  # first column in the all-accounts view
 
     def __init__(self, app: "App", parent, symbol: str):
         super().__init__(parent)
         self.app = app
         self.symbol = symbol
+        self.combined = app.combined  # all accounts added up: read-only, and the history says which account
         self.history: dict[str, tuple[float, Quote | None]] = {}  # range -> (fetched at, quote with history)
         self.rng = "1D"
 
@@ -787,7 +792,7 @@ class SymbolDetail(PageScroll):
         top = tk.Frame(page, bg=C["bg"])
         top.pack(fill="x")
         PillButton(top, tr("Back"), app.close_detail, "ghost", icon="back", padx=12, pady=5).pack(side="left")
-        for code, kind in (("BUY", "primary"), ("SELL", "outline"), ("DIVIDEND", "secondary")):
+        for code, kind in (() if self.combined else (("BUY", "primary"), ("SELL", "outline"), ("DIVIDEND", "secondary"))):
             PillButton(top, tr(TXN_TYPES[code]), lambda c=code: app.add_txn(default_type=c, default_symbol=symbol),
                        kind).pack(side="right", padx=(UI.px(8), 0))
 
@@ -805,14 +810,14 @@ class SymbolDetail(PageScroll):
         self.stats.pack(fill="x")
         separator(page).pack(fill="x", pady=(UI.px(4), UI.px(12)))
         label(page, tr("History"), font=UI.h2).pack(anchor="w", pady=(0, UI.px(6)))
-        frame, self.tree = make_tree(page, columns(self.COLUMNS))
+        frame, self.tree = make_tree(page, columns(([self.ACCOUNT_COLUMN] if self.combined else []) + self.COLUMNS))
         frame.pack(fill="both", expand=True)
         self.tree.bind("<Double-1>", self._on_double)
         self.reload()
         self.bind_wheel()
 
     def _on_double(self, event):
-        if self.tree.identify_region(event.x, event.y) == "cell" and self.tree.focus():
+        if not self.combined and self.tree.identify_region(event.x, event.y) == "cell" and self.tree.focus():
             self.app.edit_txn(int(self.tree.focus()))
 
     def _on_range(self, rng):
@@ -894,6 +899,7 @@ class SymbolDetail(PageScroll):
         self.update_chart()
 
         self.tree.delete(*self.tree.get_children())
+        names = {a["id"]: a["name"] for a in self.app.accounts}
         for row in (r for r in reversed(res.rows) if self.symbol in (r.txn.symbol, r.txn.symbol2)):
             t = row.txn
             need = TYPE_FIELDS[t.type]
@@ -902,7 +908,7 @@ class SymbolDetail(PageScroll):
             else:
                 qty_after, avg_after = row.qty_after, row.avg_cost_after
             tags = [] if t.type != "SELL" else ["gain" if row.realized > 0 else "loss" if row.realized < 0 else ""]
-            self.tree.insert("", "end", iid=str(t.id), tags=[x for x in tags if x], values=(
+            values = (
                 t.date, f"{t.type_label} ({symbol_text(t)})" if t.symbol2 else t.type_label,
                 fmt_qty(t.quantity, sign=t.type == "SPLIT") if "quantity" in need else "",
                 price_text(t),
@@ -912,7 +918,10 @@ class SymbolDetail(PageScroll):
                 fmt_price(avg_after) if qty_after else "-",
                 fmt_money(row.realized, sign=True) if t.type == "SELL" else "",
                 t.note,
-            ))
+            )
+            if self.combined:  # the running shares and average cost are those of that account
+                values = (names.get(t.account_id, ""), *values)
+            self.tree.insert("", "end", iid=str(t.id), tags=[x for x in tags if x], values=values)
 
 
 # ======================================================================
@@ -1030,6 +1039,11 @@ class App:
         ("unreal", "Unrealized P/L", 110, "e"), ("pct", "P/L %", 70, "e"),
         ("realized", "Realized P/L", 100, "e"), ("div", "Dividends", 85, "e"),
     ]
+    ACCOUNT_COLUMNS = [
+        ("name", "Account", 150, "w"), ("cash", "Cash", 105, "e"), ("value", "Market Value", 110, "e"),
+        ("total", "Total", 110, "e"), ("share", "% of Total", 85, "e"), ("unreal", "Unrealized P/L", 120, "e"),
+        ("realized", "Realized P/L", 105, "e"), ("net", "Net Deposits", 110, "e"),
+    ]
     TXN_COLUMNS = [
         ("date", "Date", 95, "w"), ("type", "Type", 90, "w"), ("symbol", "Symbol", 70, "w"),
         ("qty", "Quantity", 80, "e"), ("price", "Price", 80, "e"), ("fee", "Fee", 65, "e"),
@@ -1044,6 +1058,7 @@ class App:
         self.account_id: int | None = None
         self.txns: list[Txn] = []
         self.result = LedgerResult()
+        self.account_results: dict[int, LedgerResult] = {}  # all-accounts view: each account's own result
         self.prices: dict[str, Decimal] = {}
         self.price_info: dict[str, tuple[Decimal, str]] = {}
         self.quotes: dict[str, Quote] = {}  # live quotes (with today's intraday prices) fetched this session
@@ -1052,6 +1067,7 @@ class App:
         self._fetching = False
         self._live_job = None
         self.detail: SymbolDetail | None = None  # the open stock page, if any
+        self._tabs_combined = False
         self.symbol_search = SymbolSearch(self)
         self.stock_rows: dict[str, StockRow] = {}
         self.last_date: str | None = None
@@ -1078,7 +1094,7 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.quit)
 
         last = self.db.get_setting("last_account")
-        self.load_accounts(select_id=int(last) if last and last.isdigit() else None)
+        self.load_accounts(select_id=ALL_ACCOUNTS if last == "all" else int(last) if last and last.isdigit() else None)
         if not self.accounts:
             root.after(300, self.first_run)
         self._poll_bg()
@@ -1152,13 +1168,22 @@ class App:
         head = tk.Frame(main, bg=C["bg"])
         head.pack(fill="x")
         self.pages: dict[str, tk.Frame] = {}
-        self.page_tabs = TabBar(head, ["Holdings", "Transactions"], self._show_page, font=UI.h2, gap=26,
-                                labels={"Holdings": tr("Holdings"), "Transactions": tr("Transactions")})
-        self.page_tabs.pack(side="left")
+        self.tabs_head = head
+        self.page_tabs: TabBar | None = None
         tools = tk.Frame(head, bg=C["bg"])
         tools.pack(side="right", fill="x")
         stack = tk.Frame(main, bg=C["bg"])
         stack.pack(fill="both", expand=True, pady=(UI.px(8), 0))
+
+        # --- Accounts (all-accounts view only) ---
+        page = tk.Frame(stack, bg=C["bg"])
+        self.pages["Accounts"] = page
+        bar = tk.Frame(page, bg=C["bg"])
+        bar.pack(fill="x", pady=(0, UI.px(6)))
+        label(bar, tr("Double-click an account to open it"), font=UI.small, color=C["muted"]).pack(side="left")
+        frame, self.acct_tree = make_tree(page, columns(self.ACCOUNT_COLUMNS))
+        frame.pack(fill="both", expand=True)
+        self.acct_tree.bind("<Double-1>", self._on_account_double)
 
         # --- Holdings ---
         page = tk.Frame(stack, bg=C["bg"])
@@ -1200,7 +1225,19 @@ class App:
         self.txn_tree.bind("<Double-1>", self._on_txn_double)
         self.txn_tree.bind("<Return>", lambda e: self.edit_selected_txn())
         self.txn_tree.bind("<Delete>", lambda e: self.delete_selected_txn())
-        self._show_page("Holdings")
+        self._make_page_tabs()
+
+    def _make_page_tabs(self):
+        """The tabs under the numbers: Accounts + Holdings for the all-accounts view, else Holdings + Transactions."""
+        if self.page_tabs:
+            self.page_tabs.destroy()
+        items = ["Accounts", "Holdings"] if self.combined else ["Holdings", "Transactions"]
+        self.page_tabs = TabBar(self.tabs_head, items, self._show_page, font=UI.h2, gap=26,
+                                labels={"Accounts": tr("Accounts"), "Holdings": tr("Holdings"),
+                                        "Transactions": tr("Transactions")})
+        self.page_tabs.pack(side="left")
+        self._tabs_combined = self.combined
+        self._show_page(items[0])
 
     def _show_page(self, name):
         for key, page in self.pages.items():
@@ -1216,14 +1253,19 @@ class App:
     def _account_menu(self):
         m = style_menu(tk.Menu(self.root, tearoff=False))
         current = tk.IntVar(value=self.account_id or 0)
+        if len(self.accounts) >= 2:
+            m.add_radiobutton(label=tr("All accounts"), variable=current, value=ALL_ACCOUNTS,
+                              command=lambda: self._select_account(ALL_ACCOUNTS))
+            m.add_separator()
         for a in self.accounts:
             m.add_radiobutton(label=a["name"], variable=current, value=a["id"],
                               command=lambda i=a["id"]: self._select_account(i))
         if self.accounts:
             m.add_separator()
         m.add_command(label=tr("New account…"), command=self.new_account)
-        m.add_command(label=tr("Edit account…"), command=self.edit_account)
-        m.add_command(label=tr("Delete account…"), command=self.delete_account)
+        single = "disabled" if self.combined else "normal"  # these act on one account
+        m.add_command(label=tr("Edit account…"), command=self.edit_account, state=single)
+        m.add_command(label=tr("Delete account…"), command=self.delete_account, state=single)
         self._popup(m, self.account_btn)
 
     def _more_menu(self):
@@ -1231,7 +1273,8 @@ class App:
         m.add_command(label=tr("Add transaction"), accelerator="Ctrl+N", command=self.add_txn)
         m.add_command(label=tr("Update prices…"), command=self.update_prices)
         m.add_separator()
-        m.add_command(label=tr("Export current account to CSV…"), command=self.export_csv)
+        m.add_command(label=tr("Export current account to CSV…"), command=self.export_csv,
+                      state="disabled" if self.combined else "normal")
         m.add_command(label=tr("Back up database…"), command=self.backup)
         m.add_command(label=tr("Open data folder"), command=lambda: open_folder(self.folder))
         m.add_separator()
@@ -1284,20 +1327,35 @@ class App:
     def load_accounts(self, select_id: int | None = None):
         self.accounts = self.db.list_accounts()
         ids = [a["id"] for a in self.accounts]
-        if select_id not in ids:
+        if select_id == ALL_ACCOUNTS and len(ids) >= 2:
+            pass  # the combined view only makes sense with two or more accounts
+        elif select_id not in ids:
             select_id = ids[0] if ids else None
         self._select_account(select_id)
 
     def _select_account(self, account_id):
         if account_id != self.account_id:
             self.v_filter_symbol.set(tr(ALL))
+            self.close_detail()
         self.account_id = account_id
         acc = self.current_account()
-        self.account_btn.set_text(acc["name"] if acc else tr("No account"))
+        self.account_btn.set_text(tr("All accounts") if self.combined else acc["name"] if acc else tr("No account"))
+        self.hero.title.configure(text=tr("Net worth (all accounts)" if self.combined else "Total assets"))
+        if self.combined != self._tabs_combined:
+            self._make_page_tabs()
         self.refresh()
+
+    @property
+    def combined(self) -> bool:
+        """True in the all-accounts view: every account added up, read-only."""
+        return self.account_id == ALL_ACCOUNTS
 
     def current_account(self):
         return next((a for a in self.accounts if a["id"] == self.account_id), None)
+
+    def _on_account_double(self, event):
+        if self.acct_tree.identify_region(event.x, event.y) == "cell" and self.acct_tree.focus():
+            self._select_account(int(self.acct_tree.focus()))
 
     def require_account(self) -> bool:
         if self.account_id is None:
@@ -1387,6 +1445,10 @@ class App:
 
     def add_txn(self, default_type: str | None = None, default_symbol: str = "", parent=None):
         if self.root.grab_current() is not None or not self.require_account():
+            return
+        if self.combined:
+            messagebox.showinfo(tr(APP_NAME), tr("This is the combined view of all accounts. "
+                                                 "Choose one account to add a transaction."))
             return
         t = TxnDialog(parent or self.root, tr("Add Transaction"), suggest=self.symbol_search, positions=self.result.positions,
                       check=self._check_txn, default_type=default_type or self.last_type,
@@ -1590,7 +1652,6 @@ class App:
         if not self.v_live.get():
             hero.show(self.range, now, [], message=tr("Turn on Live prices to see the chart"))
             return
-        fallback = self.prices
         end = (int(time.time()), float(total), float(r.net_deposits))
         if self.range == "1D":
             series = {s: q.points for s, q in self.quotes.items() if s in r.positions and q.points}
@@ -1599,7 +1660,7 @@ class App:
                 hero.show("1D", now, [], message=msg)
                 return
             day, _ = self._day_change()
-            points = [(p.time, p.value, p.net_deposits) for p in value_series(r.rows, series, fallback)] + [end]
+            points = [(p.time, p.value, p.net_deposits) for p in self._value_points(series)] + [end]
             prev = float(total - day)
             hero.show("1D", now, points, baseline=prev, now_change=float(day), now_base=prev)
             return
@@ -1617,8 +1678,14 @@ class App:
             hero.show(self.range, now, [], message=tr("Loading…"))
             return
         series = {s: q.points for s, q in data.items() if q.points}
-        points = [(p.time, p.value, p.net_deposits) for p in value_series(r.rows, series, fallback)] + [end]
+        points = [(p.time, p.value, p.net_deposits) for p in self._value_points(series)] + [end]
         hero.show(self.range, now, points)
+
+    def _value_points(self, series):
+        """Account value over time from the price series; the all-accounts view adds up every account's."""
+        if self.combined:
+            return combine_series([value_series(res.rows, series, self.prices) for res in self.account_results.values()])
+        return value_series(self.result.rows, series, self.prices)
 
     def _got_history(self, key, res):
         if isinstance(res, Exception):
@@ -1630,13 +1697,17 @@ class App:
 
     # ------------------------------------------------------------ Refresh
     def refresh(self, select_txn: int | None = None):
-        if self.account_id is not None:
+        self.account_results = {}
+        if self.combined:
+            self.txns = []
+            for a in self.accounts:
+                txns = self.db.list_txns(a["id"])
+                self.txns += txns
+                self.account_results[a["id"]] = self._replay(txns)
+            self.result = combine_results(self.account_results.values())
+        elif self.account_id is not None:
             self.txns = self.db.list_txns(self.account_id)
-            try:
-                self.result = replay(self.txns)
-            except LedgerError as e:  # only happens if the database was edited by hand
-                messagebox.showerror(tr(APP_NAME), tr("Error replaying the ledger: {error}", error=e))
-                self.result = LedgerResult()
+            self.result = self._replay(self.txns)
         else:
             self.txns, self.result = [], LedgerResult()
         self.price_info = self.db.get_prices()
@@ -1650,7 +1721,11 @@ class App:
         self.refresh_txn_list(select_txn)
 
         acc = self.current_account()
-        if acc:
+        if self.combined:
+            self.status.configure(text=f"{tr('All accounts')} · {plural(str(len(self.accounts)), '{n} account', '{n} accounts')}"
+                                       f" · {tr('{n} transactions', n=len(self.txns))}"
+                                       f"        {tr('Data file: {path}', path=self.db.path)}")
+        elif acc:
             broker = f" · {acc['broker']}" if acc["broker"] else ""
             note = f" · {acc['note']}" if acc["note"] else ""
             self.status.configure(text=f"{acc['name']}{broker}{note} · {tr('{n} transactions', n=len(self.txns))}"
@@ -1660,11 +1735,19 @@ class App:
         if self.v_live.get() and any(p.symbol not in self.quotes for p in self.result.open_positions):
             self._fetch_quotes()  # new account or new stock: don't wait for the next tick
 
+    def _replay(self, txns: list[Txn]) -> LedgerResult:
+        try:
+            return replay(txns)
+        except LedgerError as e:  # only happens if the database was edited by hand
+            messagebox.showerror(tr(APP_NAME), tr("Error replaying the ledger: {error}", error=e))
+            return LedgerResult()
+
     def refresh_view(self):
         """Redraw everything that depends on prices."""
         self.refresh_chart()
         self.refresh_stats()
         self.refresh_sidebar()
+        self.refresh_accounts()
         self.refresh_holdings()
         if self.detail:
             self.detail.reload()
@@ -1721,6 +1804,38 @@ class App:
             self.stock_rows[p.symbol].show(p, self.quotes.get(p.symbol), self.prices.get(p.symbol))
         self.side_count.configure(text=plural(str(len(syms)), "{n} holding", "{n} holdings") if syms else "")
 
+    def refresh_accounts(self):
+        """The Accounts tab of the all-accounts view: one row per account."""
+        tree = self.acct_tree
+        selected = tree.focus()
+        tree.delete(*tree.get_children())
+        tree.hover_row = ""
+        if not self.combined:
+            return
+        grand = self.result.cash + valuation(self.result, self.prices).market_value
+        for a in self.accounts:
+            res = self.account_results.get(a["id"])
+            if res is None:
+                continue
+            v = valuation(res, self.prices)
+            total = res.cash + v.market_value
+            priced = any(p.symbol in self.prices for p in res.open_positions)
+            tree.insert("", "end", iid=str(a["id"]), values=(
+                a["name"],
+                fmt_money(res.cash),
+                fmt_money(v.market_value),
+                fmt_money(total),
+                f"{total / grand * 100:.1f}%" if grand > 0 else "-",
+                fmt_money(v.unrealized, sign=True) if priced else "-",
+                fmt_money(res.realized, sign=True),
+                fmt_money(res.net_deposits),
+            ))
+        if tree.sort_state:
+            sort_tree(tree, *next(iter(tree.sort_state.items())))
+        if selected and tree.exists(selected):
+            tree.selection_set(selected)
+            tree.focus(selected)
+
     def refresh_holdings(self):
         tree = self.hold_tree
         selected = tree.focus()
@@ -1765,6 +1880,8 @@ class App:
         keep = select_txn or (int(tree.focus()) if tree.focus() else None)
         tree.delete(*tree.get_children())
         tree.hover_row = ""
+        if self.combined:  # the transaction list belongs to one account
+            return
         sym = self.v_filter_symbol.get()
         typ = self.v_filter_type.get()
         shown = 0
@@ -1857,7 +1974,8 @@ class App:
             "6. Click a stock in the Stocks list for its own page with chart and history.\n"
             "7. Dividend reinvestment: record a Dividend, then a Buy.\n"
             "8. Stock split: record a Split with the number of shares added (total cost is unchanged).\n"
-            "9. Cost basis uses the average cost method.\n\n"
+            "9. Cost basis uses the average cost method.\n"
+            "10. With two or more accounts, \"All accounts\" in the account menu adds them up (read-only).\n\n"
             "Data is stored in:\n{path}\nIt is backed up to the backups folder the first time you open the app each day.",
             seconds=LIVE_INTERVAL, path=self.db.path,
         ))
@@ -1870,7 +1988,7 @@ class App:
 
     def quit(self):
         if self.account_id is not None:
-            self.db.set_setting("last_account", str(self.account_id))
+            self.db.set_setting("last_account", "all" if self.combined else str(self.account_id))
         self.db.close()
         self.root.destroy()
 

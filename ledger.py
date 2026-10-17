@@ -344,6 +344,30 @@ def replay(txns) -> LedgerResult:
     return res
 
 
+def combine_results(results) -> LedgerResult:
+    """Add up several accounts (each already replayed) into one result, for the all-accounts view.
+
+    Cash and totals are summed; a stock held in several accounts becomes one position (shares, cost, realized
+    and dividends added, so its average cost is total cost / total shares). The rows are every account's rows
+    in date order -- their running balances still belong to their own account."""
+    total = LedgerResult()
+    for r in results:
+        total.cash += r.cash
+        total.deposits += r.deposits
+        total.withdrawals += r.withdrawals
+        total.interest += r.interest
+        total.fees += r.fees
+        for symbol, p in r.positions.items():
+            q = total.positions.setdefault(symbol, Position(symbol))
+            q.quantity += p.quantity
+            q.cost += p.cost
+            q.realized += p.realized
+            q.dividends += p.dividends
+        total.rows.extend(r.rows)
+    total.rows.sort(key=lambda row: sort_key(row.txn))
+    return total
+
+
 def _take_shares(pos: Position, t: Txn) -> Decimal:
     """Remove shares on sell/transfer out, reducing cost at average cost; return the cost removed."""
     if t.quantity > pos.quantity:
@@ -468,6 +492,21 @@ def value_series(rows: list[Row], prices: dict[str, list[tuple[int, float]]],
                 value += qty * float(fallback.get(sym, avg))
         out.append(ValuePoint(ts, value, net_dep))
     return out
+
+
+def combine_series(series_list: list[list[ValuePoint]]) -> list[ValuePoint]:
+    """Add up the value series of several accounts (made from the same prices) into one.
+
+    An account has no points before its first transaction, so it simply adds nothing until then."""
+    total: dict[int, ValuePoint] = {}
+    for series in series_list:
+        for p in series:
+            if p.time in total:
+                total[p.time].value += p.value
+                total[p.time].net_deposits += p.net_deposits
+            else:
+                total[p.time] = ValuePoint(p.time, p.value, p.net_deposits)
+    return [total[t] for t in sorted(total)]
 
 
 # ----------------------------------------------------------------------
