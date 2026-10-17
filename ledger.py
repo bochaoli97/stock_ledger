@@ -39,6 +39,7 @@ TXN_TYPES: dict[str, str] = {
     "SHARES_OUT": "Shares Out",
     "SPLIT": "Split",
     "SYMBOL_CHANGE": "Symbol Change",
+    "DISTRIBUTION": "Distribution",
 }
 TYPE_BY_LABEL = {label: code for code, label in TXN_TYPES.items()}
 
@@ -55,10 +56,13 @@ TYPE_FIELDS: dict[str, tuple[str, ...]] = {
     "SHARES_OUT": ("symbol", "quantity"),
     "SPLIT": ("symbol", "quantity"),
     "SYMBOL_CHANGE": ("symbol", "symbol2", "quantity"),  # old symbol -> new symbol; quantity = new shares
+    # stock -> new security handed out on it (spin-off, warrants, rights); quantity = units received,
+    # price = percent of the stock's cost basis that moves to the new security (0-100)
+    "DISTRIBUTION": ("symbol", "symbol2", "quantity", "price"),
 }
 
 # Types tied to a specific stock
-STOCK_TYPES = {"DIVIDEND", "BUY", "SELL", "SHARES_IN", "SHARES_OUT", "SPLIT", "SYMBOL_CHANGE"}
+STOCK_TYPES = {"DIVIDEND", "BUY", "SELL", "SHARES_IN", "SHARES_OUT", "SPLIT", "SYMBOL_CHANGE", "DISTRIBUTION"}
 
 
 class LedgerError(ValueError):
@@ -112,12 +116,12 @@ class Txn:
     type: str  # a key of TXN_TYPES
     symbol: str = ""
     quantity: Decimal = ZERO  # shares (for SPLIT: the change in shares, may be negative)
-    price: Decimal = ZERO  # trade price; for SHARES_IN: cost per share
+    price: Decimal = ZERO  # trade price; for SHARES_IN: cost per share; for DISTRIBUTION: percent of cost moved
     fee: Decimal = ZERO  # trade commission
     amount: Decimal = ZERO  # amount for deposit/withdrawal/dividend/interest/fee
     note: str = ""
     id: int | None = None
-    symbol2: str = ""  # SYMBOL_CHANGE: the new symbol (ticker change, or shares converted in a merger)
+    symbol2: str = ""  # SYMBOL_CHANGE / DISTRIBUTION: the new symbol (ticker change, merger, or what was handed out)
     account_id: int | None = None
 
     @property
@@ -177,6 +181,8 @@ class Txn:
             raise ValueError(tr("Price must be greater than 0"))
         if self.type == "SHARES_IN" and self.price < 0:
             raise ValueError(tr("Cost per share cannot be negative"))
+        if self.type == "DISTRIBUTION" and not 0 <= self.price <= 100:
+            raise ValueError(tr("Cost basis moved must be between 0 and 100%"))
         if self.fee < 0:
             raise ValueError(tr("Fee cannot be negative"))
 
@@ -206,9 +212,11 @@ class Row:
 
     txn: Txn
     cash_after: Decimal  # cash balance after this transaction
-    qty_after: Decimal  # shares of this stock held after this transaction (SYMBOL_CHANGE: of the new symbol)
+    qty_after: Decimal  # shares of this stock held after this transaction (with symbol2: of the new symbol)
     avg_cost_after: Decimal  # average cost of this stock after this transaction
     realized: Decimal  # realized P/L from this transaction (sells only)
+    # SYMBOL_CHANGE / DISTRIBUTION: (shares, average cost) of the original symbol after this transaction
+    source_after: tuple[Decimal, Decimal] | None = None
 
 
 @dataclass
@@ -261,6 +269,7 @@ def replay(txns) -> LedgerResult:
         if t.type in STOCK_TYPES:
             pos = res.positions.setdefault(t.symbol, Position(t.symbol))
         realized = ZERO
+        source_after = None
 
         if t.type == "DEPOSIT":
             res.deposits += t.amount
@@ -306,6 +315,19 @@ def replay(txns) -> LedgerResult:
             new.quantity += t.quantity
             new.cost += pos.cost
             pos.quantity = pos.cost = ZERO
+            source_after = (ZERO, ZERO)
+            pos = new  # this row reports the new holding
+        elif t.type == "DISTRIBUTION":
+            # the stock is kept; the new security gets the given share of its cost basis (no gain or loss)
+            if pos.quantity <= 0:
+                raise LedgerError(tr("{date} {symbol}: no shares held at the time of the distribution",
+                                     date=t.date, symbol=t.symbol))
+            moved = pos.cost * t.price / 100
+            pos.cost -= moved
+            new = res.positions.setdefault(t.symbol2, Position(t.symbol2))
+            new.quantity += t.quantity
+            new.cost += moved
+            source_after = (pos.quantity, pos.avg_cost)
             pos = new  # this row reports the new holding
 
         res.cash += t.cash_change
@@ -316,6 +338,7 @@ def replay(txns) -> LedgerResult:
                 qty_after=pos.quantity if pos else ZERO,
                 avg_cost_after=pos.avg_cost if pos else ZERO,
                 realized=realized,
+                source_after=source_after,
             )
         )
     return res
@@ -396,8 +419,8 @@ def value_series(rows: list[Row], prices: dict[str, list[tuple[int, float]]],
             net += float(t.amount)
         elif t.type == "WITHDRAW":
             net -= float(t.amount)
-        if t.type == "SYMBOL_CHANGE":
-            holding[t.symbol] = (0.0, 0.0)
+        if r.source_after is not None:  # symbol change or distribution: both symbols' holdings change
+            holding[t.symbol] = (float(r.source_after[0]), float(r.source_after[1]))
             holding[t.symbol2] = (float(r.qty_after), float(r.avg_cost_after))
         elif t.type in STOCK_TYPES:
             holding[t.symbol] = (float(r.qty_after), float(r.avg_cost_after))

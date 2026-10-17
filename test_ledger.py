@@ -330,6 +330,42 @@ def test_symbol_change_checks():
     raises(LedgerError, replay, [change(id=1)], match="no shares held to change into NEW")
 
 
+def distribution(pct, qty=1000, **kw):
+    return Txn(date="2026-02-01", type="DISTRIBUTION",
+               **{"symbol": "SKYD", "symbol2": "SKYD.WT", "quantity": D(qty), "price": D(str(pct)), **kw})
+
+
+def test_distribution_moves_part_of_the_cost():
+    r = replay(txns(("2026-01-05", "BUY", "SKYD", 1000, 10, 0, 0)) + [
+        distribution(10, id=2),  # 1 warrant per share; 10% of the cost goes to the warrants
+        Txn(date="2026-03-01", type="SELL", symbol="SKYD.WT", quantity=D(1000), price=D("1.5"), id=3)])
+    stock, warrants = r.positions["SKYD"], r.positions["SKYD.WT"]
+    assert stock.quantity == 1000 and stock.cost == 9000 and stock.avg_cost == 9  # shares unchanged
+    assert warrants.quantity == 0 and warrants.realized == 500  # 1500 proceeds - 1000 cost
+    row = r.rows[1]
+    assert row.qty_after == 1000 and row.avg_cost_after == 1 and row.txn.cash_change == 0
+    assert row.source_after == (1000, 9)
+    assert r.cash == -10000 + 1500
+
+
+def test_distribution_at_zero_cost():
+    r = replay(txns(("2026-01-05", "BUY", "SKYD", 10, 10, 1, 0)) + [distribution(0, qty=5, id=2)])
+    assert r.positions["SKYD"].cost == 101 and r.positions["SKYD.WT"].cost == 0
+    assert r.positions["SKYD.WT"].quantity == 5 and r.total_cost == 101
+
+
+def test_distribution_checks():
+    distribution(0).validate()
+    distribution(100).validate()
+    raises(ValueError, distribution(-1).validate, match="between 0 and 100%")
+    raises(ValueError, distribution("100.01").validate, match="between 0 and 100%")
+    raises(ValueError, distribution(10, symbol2="").validate, match="Please enter the new symbol")
+    raises(ValueError, distribution(10, symbol2="skyd").validate, match="must differ")
+    raises(ValueError, distribution(10, qty=0).validate, match="Quantity must be greater than 0")
+    assert distribution(10, fee=D(1), amount=D(2)).normalized().price == 10  # the percent is kept
+    raises(LedgerError, replay, [distribution(10, id=1)], match="no shares held at the time of the distribution")
+
+
 def test_crypto_amounts():
     r = replay(txns(
         ("2026-01-02", "DEPOSIT", "", 0, 0, 0, 100),
@@ -550,6 +586,16 @@ def test_value_series_symbol_change():
               "NEW": [(ts("2026-01-05"), 12.0)]}
     pts = value_series(rows, prices)
     assert [p.value for p in pts] == [-100 + 10 * 11.0, -100 + 10 * 12.0]  # valued by the symbol held that day
+
+
+def test_value_series_distribution():
+    rows = replay(txns(("2026-01-02", "BUY", "SKYD", 1000, 10, 0, 0)) + [distribution(20, id=2)]).rows
+    prices = {"SKYD": [(ts("2026-01-05"), 9.0), (ts("2026-02-05"), 8.0)]}
+    pts = value_series(rows, prices)
+    # warrants have no price: valued at their average cost, 2000 / 1000 = 2
+    assert [p.value for p in pts] == [-10000 + 1000 * 9.0, -10000 + 1000 * 8.0 + 1000 * 2.0]
+    pts = value_series(rows, {**prices, "SKYD.WT": [(ts("2026-02-05"), 1.5)]})
+    assert pts[-1].value == -10000 + 1000 * 8.0 + 1000 * 1.5
 
 
 def test_value_series_after_position_closed():
@@ -809,6 +855,9 @@ def test_crypto_symbols():
 
     assert app.holding_text("BTC-USD", D("0.5")) == "0.5 coins" and app.holding_text("AAPL", D(1)) == "1 share"
     assert app.symbol_text(Txn(date="2026-01-01", type="SYMBOL_CHANGE", symbol="A", symbol2="B")) == "A → B"
+    assert app.price_text(distribution("12.5")) == "12.5%" and app.price_text(distribution(0)) == "0%"
+    assert app.price_text(Txn(date="2026-01-01", type="BUY", price=D(5))) == "5.00"
+    assert app.price_text(Txn(date="2026-01-01", type="SHARES_OUT", price=D(5))) == ""
 
 
 def test_symbol_conversion():
@@ -958,6 +1007,169 @@ def test_symbol_search_suggestions():
         search("zz", show)
         scheduled.pop()()
     assert shown == [("zz", [])]  # a failed search leaves the local results as they were
+
+
+# ----------------------------------------------------------------------
+# Main window (needs a display; skipped where there is none, e.g. over plain SSH)
+# ----------------------------------------------------------------------
+def _gui_window():
+    """(tk root, app.App) with one account holding SKYD and AAPL and live prices off, or None without a display."""
+    import tkinter as tk
+    import app
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        return None
+    root.withdraw()
+    folder = Path(tempfile.mkdtemp())
+    db = Storage(folder / "gui.db")
+    db.set_setting("live_prices", "0")  # no network in tests
+    acc = db.create_account("Test")
+    for kw in (dict(date="2026-01-02", type="DEPOSIT", amount=D(20000)),
+               dict(date="2026-01-05", type="BUY", symbol="SKYD", quantity=D(1000), price=D(10)),
+               dict(date="2026-01-06", type="BUY", symbol="AAPL", quantity=D(10), price=D(150))):
+        db.add_txn(Txn(account_id=acc, **kw))
+    app.set_theme("light")
+    app.UI.setup(root)
+    root.deiconify()
+    return root, app.App(root, db, folder)
+
+
+def _close_gui(root):
+    """Destroy a test window; its pending timers (background polling) must not fire later in another one."""
+    for job in root.tk.splitlist(root.tk.call("after", "info")):
+        root.after_cancel(job)
+    root.destroy()
+
+
+def test_tables_scroll_sideways_when_narrow():
+    import tkinter as tk
+    import app
+    from ui import make_tree
+
+    win = _gui_window()
+    if win is None:
+        return
+    root, _ = win
+    try:
+        frame, tree = make_tree(root, app.columns(app.App.HOLD_COLUMNS))
+        frame.place(x=0, y=0, width=600, height=300)  # narrower than the columns need
+        bar = next(w for w in frame.winfo_children() if w.winfo_class() == "TScrollbar" and str(w.cget("orient")) == "horizontal")
+        root.update()
+        assert tree.xview()[1] < 1 and bar.winfo_ismapped()  # columns keep their width; the rest is reached by scrolling
+        assert all(tree.column(c, "width") >= app.UI.px(w) for c, (_, _, w, _) in zip(tree["columns"], app.App.HOLD_COLUMNS))
+        total = sum(tree.column(c, "width") for c in tree["columns"])
+        for widget, seq, kw in ((tree, "<Shift-MouseWheel>", dict(delta=-120)), (tree, "<Shift-Button-5>", {}),
+                                (bar, "<MouseWheel>", dict(delta=-120)), (bar, "<Button-5>", {})):
+            tree.xview_moveto(0)
+            widget.event_generate(seq, x=5, y=3, **kw)  # one notch of the wheel moves a useful distance, not 1-5 pixels
+            root.update()
+            assert round(tree.xview()[0] * total) == app.UI.px(80), seq
+        tree.event_generate("<Shift-MouseWheel>", x=5, y=3, delta=120)  # wheel up goes back left
+        root.update()
+        assert tree.xview()[0] == 0
+        frame.place_configure(width=1800)
+        root.update()
+        assert tree.xview() == (0.0, 1.0) and not bar.winfo_ismapped()  # room to spare: stretched, no scroll bar
+    finally:
+        _close_gui(root)
+
+
+def test_stock_page_opens_inside_the_window():
+    win = _gui_window()
+    if win is None:
+        return
+    root, a = win
+    try:
+        root.update()
+        assert a.detail is None and a.overview.winfo_ismapped()
+        a.open_symbol("SKYD")
+        root.update()
+        assert a.detail.symbol == "SKYD" and a.detail.winfo_ismapped() and not a.overview.winfo_ismapped()
+        assert a.detail.winfo_toplevel() is root  # not a window of its own
+        assert root.title().startswith("SKYD") and len(a.detail.tree.get_children()) == 1
+        a.open_symbol("SKYD")  # already open: nothing changes
+        a.open_symbol("AAPL")  # picking another stock switches the page
+        root.update()
+        assert a.detail.symbol == "AAPL" and root.title().startswith("AAPL")
+        a.open_symbol("NOPE")  # unknown symbol: ignored
+        assert a.detail.symbol == "AAPL"
+        a.rebuild()  # a theme / language / text size change keeps you on the same stock
+        root.update()
+        assert a.detail.symbol == "AAPL" and not a.overview.winfo_ismapped()
+        root.event_generate("<Escape>")  # Esc goes back
+        root.update()
+        assert a.detail is None and a.overview.winfo_ismapped() and root.title() == i18n.tr("Stock Ledger")
+        a.open_symbol("SKYD")
+        a.db.delete_txn(next(t.id for t in a.txns if t.symbol == "SKYD"))
+        a.refresh()  # the stock no longer exists: back to the overview instead of an empty page
+        root.update()
+        assert a.detail is None and a.overview.winfo_ismapped()
+    finally:
+        _close_gui(root)
+
+
+def test_pages_scroll_up_and_down_when_the_window_is_short():
+    win = _gui_window()
+    if win is None:
+        return
+    root, a = win
+    try:
+        def check(page, tree):
+            root.update()
+            return page.sb.winfo_ismapped(), tree.winfo_ismapped(), tree.winfo_height()
+
+        for open_stock in (False, True):
+            if open_stock:
+                a.open_symbol("SKYD")
+            page, tree = (a.detail, a.detail.tree) if open_stock else (a.overview, a.hold_tree)
+            hero = (a.detail if open_stock else a).hero
+            root.geometry("1440x1000")  # plenty of room: no scroll bar, the table takes what is left
+            scrolls, shown, tall = check(page, tree)
+            assert not scrolls and shown
+            root.geometry("1000x640")  # short: the table keeps its rows and the page scrolls instead
+            scrolls, shown, short = check(page, tree)
+            assert scrolls and shown and 100 <= short < tall  # still at least a few rows tall
+            top = page.canvas.yview()[0]
+            hero.value.event_generate("<MouseWheel>", delta=-120, x=5, y=5)  # the wheel scrolls the page...
+            root.update()
+            assert page.canvas.yview()[0] > top
+            moved = page.canvas.yview()[0]
+            hero.value.event_generate("<Shift-MouseWheel>", delta=-120, x=5, y=5)  # ...but Shift is for tables
+            root.update()
+            assert page.canvas.yview()[0] == moved
+            side = next(w for w in tree.master.winfo_children()
+                        if w.winfo_class() == "TScrollbar" and str(w.cget("orient")) == "horizontal")
+            side.event_generate("<MouseWheel>", delta=-120, x=5, y=3)  # on the sideways bar the wheel goes sideways
+            root.update()
+            assert page.canvas.yview()[0] == moved and tree.xview()[0] > 0
+            tree.xview_moveto(0)
+            root.geometry("1440x1000")
+            scrolls, _, _ = check(page, tree)
+            assert not scrolls and page.canvas.yview()[0] == 0  # back to the top once everything fits
+    finally:
+        _close_gui(root)
+
+
+def test_reset_filters_button_only_shows_while_filtering():
+    win = _gui_window()
+    if win is None:
+        return
+    root, a = win
+    try:
+        a._show_page("Transactions")
+        root.update()
+        assert not a.reset_btn.winfo_ismapped()
+        a.v_filter_symbol.set("AAPL")
+        root.update()
+        assert a.reset_btn.winfo_ismapped() and len(a.txn_tree.get_children()) == 1
+        a._clear_filters()  # only the view changes; no transaction is deleted
+        root.update()
+        assert not a.reset_btn.winfo_ismapped()
+        assert len(a.txn_tree.get_children()) == 3 and len(a.db.list_txns(a.account_id)) == 3
+    finally:
+        _close_gui(root)
 
 
 # ----------------------------------------------------------------------

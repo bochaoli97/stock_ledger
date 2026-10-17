@@ -178,6 +178,12 @@ class UI:
                     bordercolor=C["bg"], lightcolor=C["chip_hover"], darkcolor=C["chip_hover"],
                     gripcount=0, width=cls.px(8), arrowsize=cls.px(8))
         s.map("Slim.Vertical.TScrollbar", background=[("active", C["muted"])])
+        s.layout("Slim.Horizontal.TScrollbar", [("Horizontal.Scrollbar.trough", {"sticky": "we", "children": [
+            ("Horizontal.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+        s.configure("Slim.Horizontal.TScrollbar", troughcolor=C["bg"], background=C["chip_hover"],
+                    bordercolor=C["bg"], lightcolor=C["chip_hover"], darkcolor=C["chip_hover"],
+                    gripcount=0, width=cls.px(8), arrowsize=cls.px(8))
+        s.map("Slim.Horizontal.TScrollbar", background=[("active", C["muted"])])
 
     @classmethod
     def font(cls, size: int, weight: str = "normal") -> tkfont.Font:
@@ -238,7 +244,8 @@ def round_rect(canvas: tk.Canvas, x1, y1, x2, y2, r, **kw):
 
 class PillButton(tk.Canvas):
     """Fully rounded button. kind: primary (green), secondary (grey), outline (green border), ghost (text only).
-    caret=True adds a small down arrow; icon="more" draws three dots instead of text.
+    caret=True adds a small down arrow; icon="more" draws three dots instead of text; icon="back" puts a
+    left-pointing chevron before the text.
     (Shapes are drawn rather than typed as symbols, because not every font has those glyphs.)"""
 
     def __init__(self, parent, text: str, command, kind: str = "primary", *, font=None, padx=16, pady=7, bg=None,
@@ -261,7 +268,8 @@ class PillButton(tk.Canvas):
     def _content_width(self):
         if self.icon == "more":
             return UI.px(18)
-        return self.font.measure(self.text) + (UI.px(16) if self.caret else 0)
+        extra = UI.px(16) if self.caret else UI.px(18) if self.icon == "back" else 0
+        return self.font.measure(self.text) + extra
 
     def set_text(self, text: str):
         self.text = text
@@ -287,6 +295,14 @@ class PillButton(tk.Canvas):
             r = max(UI.px(1.6), 1.5)
             for dx in (-UI.px(6), 0, UI.px(6)):
                 self.create_oval(w / 2 + dx - r, h / 2 - r, w / 2 + dx + r, h / 2 + r, fill=fg, outline=fg)
+            return
+        if self.icon == "back":
+            a = UI.px(4)
+            left = w / 2 - self._content_width() / 2
+            cx, cy = left + a, h / 2
+            self.create_line(cx + a / 2, cy - a, cx - a / 2, cy, cx + a / 2, cy + a, fill=fg,
+                             width=max(UI.px(1.5), 1.5), capstyle="round", joinstyle="round")
+            self.create_text(left + UI.px(18), cy, text=self.text, anchor="w", fill=fg, font=self.font)
             return
         tx = w / 2 - (UI.px(8) if self.caret else 0)
         self.create_text(tx, h / 2, text=self.text, fill=fg, font=self.font)
@@ -560,6 +576,60 @@ class ScrollFrame(tk.Frame):
                 self.unbind_all(s)
 
 
+class PageScroll(tk.Frame):
+    """A whole page that scrolls up and down when the window is too short for it; put children in .inner.
+
+    With room to spare the page is as tall as the window, so a table can stretch to fill the rest; otherwise it
+    is as tall as its content needs and a slim scroll bar shows. Call bind_wheel() once the page is built so the
+    mouse wheel scrolls it (a table that has rows to scroll keeps the wheel for itself)."""
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, bg=C["bg"], **kw)
+        self.canvas = tk.Canvas(self, bg=C["bg"], highlightthickness=0, bd=0, yscrollincrement=UI.px(30))
+        self.inner = tk.Frame(self.canvas, bg=C["bg"])
+        self.sb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview, style="Slim.Vertical.TScrollbar")
+        self.canvas.configure(yscrollcommand=self.sb.set)
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.inner.bind("<Configure>", lambda e: self._fit())
+        self.canvas.bind("<Configure>", lambda e: self._fit())
+
+    def _fit(self):
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        need = self.inner.winfo_reqheight()
+        height = max(h, need)
+        self.canvas.itemconfigure(self._win, width=w, height=height)
+        self.canvas.configure(scrollregion=(0, 0, w, height))
+        scrolls = need > h > 1
+        if scrolls and not self.sb.winfo_ismapped():
+            self.sb.pack(side="right", fill="y")
+        elif not scrolls and self.sb.winfo_ismapped():
+            self.sb.pack_forget()
+            self.canvas.yview_moveto(0)
+
+    def refit(self):
+        """Re-measure after the content changed size (e.g. another tab was shown)."""
+        self.update_idletasks()
+        self._fit()
+
+    def bind_wheel(self):
+        def scroll(e):
+            if not self.sb.winfo_ismapped() or e.state & 0x1:  # nothing to scroll; Shift = sideways, for tables
+                return
+            kind = e.widget.winfo_class()
+            if kind == "TCombobox" or (kind == "Treeview" and e.widget.yview() != (0.0, 1.0)):
+                return
+            self.canvas.yview_scroll(-2 if (e.num == 4 or e.delta > 0) else 2, "units")
+
+        def walk(widget):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                widget.bind(seq, scroll, add="+")
+            for child in widget.winfo_children():
+                walk(child)
+
+        walk(self)
+
+
 class SymbolEntry(ttk.Entry):
     """A text box with a type-ahead dropdown of matching stocks, like Robinhood's search.
 
@@ -769,18 +839,48 @@ class SymbolEntry(ttk.Entry):
 # ======================================================================
 # Tables
 # ======================================================================
+WHEEL_STEP = 80  # pixels a table scrolls sideways per notch of the mouse wheel
+
+
 def make_tree(parent, columns: list[tuple[str, str, int, str]]):
-    """Create a table with a slim scrollbar, click-to-sort headers and row hover.
-    columns: (key, title, width, anchor w/e/center)"""
+    """Create a table with slim scrollbars, click-to-sort headers and row hover.
+    columns: (key, title, width, anchor w/e/center)
+
+    A column never gets narrower than its width: when the window is too small for all of them the table
+    scrolls sideways (the scrollbar only shows then, and Shift + wheel moves it); when there is room the
+    columns stretch to fill it.
+    It asks for 5 rows; with more room it grows, with less the page it sits on scrolls (see PageScroll)."""
     frame = ttk.Frame(parent)
-    tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", selectmode="browse")
+    tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", selectmode="browse", height=5)
     for key, text, width, anchor in columns:
         tree.heading(key, text=text.upper(), anchor=anchor, command=lambda k=key: sort_tree(tree, k))
-        tree.column(key, width=UI.px(width), minwidth=UI.px(40), anchor=anchor, stretch=True)
+        tree.column(key, width=UI.px(width), minwidth=UI.px(width), anchor=anchor, stretch=True)
     vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview, style="Slim.Vertical.TScrollbar")
-    tree.configure(yscrollcommand=vsb.set)
+    hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview, style="Slim.Horizontal.TScrollbar")
+
+    def on_xscroll(first, last):
+        hsb.set(first, last)
+        if float(first) <= 0 and float(last) >= 1:
+            hsb.grid_remove()
+        else:
+            hsb.grid()
+
+    def sideways(event):
+        # Tk's own binding moves 1 pixel (Windows) or 5 (Linux) per wheel notch, far too slow for a wide table
+        notches = {4: 1, 5: -1}.get(event.num, event.delta / 120)
+        tree.xview_scroll(round(-notches * UI.px(WHEEL_STEP)), "units")  # a ttk "unit" is one pixel
+        return "break"
+
+    for widget, sequences in ((tree, ("<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>")),
+                              (hsb, ("<MouseWheel>", "<Button-4>", "<Button-5>"))):
+        for sequence in sequences:
+            widget.bind(sequence, sideways)
+
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=on_xscroll)
     tree.grid(row=0, column=0, sticky="nsew")
     vsb.grid(row=0, column=1, sticky="ns")
+    hsb.grid(row=1, column=0, sticky="we")
+    hsb.grid_remove()
     frame.rowconfigure(0, weight=1)
     frame.columnconfigure(0, weight=1)
     tree.tag_configure("hover", background=C["hover"])

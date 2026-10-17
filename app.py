@@ -58,6 +58,7 @@ from ui import (
     TEXT_SIZES,
     UI,
     LineChart,
+    PageScroll,
     PillButton,
     ScrollFrame,
     SymbolEntry,
@@ -163,6 +164,13 @@ def holding_text(symbol: str, qty: Decimal) -> str:
 def symbol_text(t: Txn) -> str:
     """The symbol column: 'PSKY → NEW' for a symbol change."""
     return f"{t.symbol} → {t.symbol2}" if t.symbol2 else t.symbol
+
+
+def price_text(t: Txn) -> str:
+    """The price column: blank for types without a price; the share of cost moved for a distribution."""
+    if "price" not in TYPE_FIELDS[t.type]:
+        return ""
+    return f"{fmt_qty(t.price)}%" if t.type == "DISTRIBUTION" else fmt_price(t.price)
 
 
 WEEKDAYS_ZH = "一二三四五六日"
@@ -306,6 +314,9 @@ class TxnDialog(Dialog):
                  "Use a negative number for a reverse split.",
         "SYMBOL_CHANGE": "Ticker change or merger conversion: the whole position moves to the new symbol with its "
                          "cost basis (no gain or loss). Enter the new shares received; for 1-for-1, press All.",
+        "DISTRIBUTION": "Spin-off, warrants or rights handed out on a stock you hold: the new security becomes its own "
+                        "position and takes the given percent of the stock's cost basis (0 moves none). Your shares "
+                        "of the stock stay the same. Does not affect cash.",
     }
 
     def __init__(self, parent, title, *, suggest, positions, check, initial: Txn | None = None,
@@ -392,10 +403,13 @@ class TxnDialog(Dialog):
                 w.grid() if key in need else w.grid_remove()
         if code not in ("SELL", "SHARES_OUT", "SYMBOL_CHANGE"):
             self.all_btn.grid_remove()
+        self.labels["symbol2"].configure(text=tr("Received symbol" if code == "DISTRIBUTION" else "New symbol"))
         self.labels["quantity"].configure(text=tr("Share change" if code == "SPLIT" else
                                                   "New shares received" if code == "SYMBOL_CHANGE" else
+                                                  "Quantity received" if code == "DISTRIBUTION" else
                                                   "Quantity (shares)"))
-        self.labels["price"].configure(text=tr("Cost per share" if code == "SHARES_IN" else "Price"))
+        self.labels["price"].configure(text=tr("Cost per share" if code == "SHARES_IN" else
+                                               "Cost basis moved (%)" if code == "DISTRIBUTION" else "Price"))
         self.labels["amount"].configure(text=tr(self.AMOUNT_LABELS.get(code, "Amount")))
         self.hint.configure(text=tr(self.HINTS[code]) if code in self.HINTS else "")
         self._update_preview()
@@ -447,6 +461,13 @@ class TxnDialog(Dialog):
                 lines.append(tr("{old_qty} shares of {symbol} become {qty} shares of {new}; cost basis {cost} carries over",
                                 old_qty=fmt_qty(pos.quantity), symbol=sym, qty=fmt_qty(t.quantity), new=sym2,
                                 cost=fmt_money(pos.cost)))
+            if (code == "DISTRIBUTION" and pos and pos.is_open and t.quantity and sym2 and sym2 != sym
+                    and 0 <= t.price <= 100):
+                moved = pos.cost * t.price / 100
+                lines.append(tr("{pct}% of {symbol}'s cost basis ({moved}) goes to {qty} {new}; "
+                                "{symbol} average cost becomes {avg}",
+                                pct=fmt_qty(t.price), symbol=sym, moved=fmt_money(moved), qty=fmt_qty(t.quantity),
+                                new=sym2, avg=fmt_price((pos.cost - moved) / pos.quantity)))
             if code == "SELL" and pos and pos.is_open and t.quantity and t.price and t.quantity <= pos.quantity:
                 est = t.quantity * t.price - t.fee - pos.avg_cost * t.quantity
                 lines.append(tr("Estimated realized P/L {value}", value=fmt_money(est, sign=True)))
@@ -656,7 +677,7 @@ class PriceDialog(Dialog):
 class StatGrid(tk.Frame):
     """Grid of small 'LABEL / value / note' stats."""
 
-    def __init__(self, parent, specs: list[tuple[str, str]], columns: int = 4):
+    def __init__(self, parent, specs: list[tuple[str, str]], columns: int = 4, notes: bool = True):
         super().__init__(parent, bg=C["bg"])
         self.cells: dict[str, tuple[tk.Label, tk.Label]] = {}
         for i, (key, title) in enumerate(specs):
@@ -666,7 +687,8 @@ class StatGrid(tk.Frame):
             value = label(cell, "-", font=UI.stat)
             value.pack(anchor="w", pady=(UI.px(2), 0))
             note = label(cell, "", font=UI.small, color=C["muted"])
-            note.pack(anchor="w")
+            if notes:  # without the line under each value the grid is shorter (the note label is then never shown)
+                note.pack(anchor="w")
             self.cells[key] = (value, note)
         for c in range(columns):
             self.columnconfigure(c, weight=1, uniform="stat")
@@ -744,7 +766,9 @@ class Hero(tk.Frame):
 # ======================================================================
 # Per-stock page
 # ======================================================================
-class SymbolDetail(tk.Toplevel):
+class SymbolDetail(PageScroll):
+    """One stock's page. It takes the place of the overview in the main window (Back or Esc returns)."""
+
     COLUMNS = [
         ("date", "Date", 95, "w"), ("type", "Type", 90, "w"), ("qty", "Quantity", 80, "e"),
         ("price", "Price", 80, "e"), ("fee", "Fee", 65, "e"), ("cash", "Cash Change", 100, "e"),
@@ -752,50 +776,44 @@ class SymbolDetail(tk.Toplevel):
         ("realized", "Realized P/L", 100, "e"), ("note", "Note", 140, "w"),
     ]
 
-    def __init__(self, app: "App", symbol: str):
-        super().__init__(app.root, bg=C["bg"])
+    def __init__(self, app: "App", parent, symbol: str):
+        super().__init__(parent)
         self.app = app
         self.symbol = symbol
         self.history: dict[str, tuple[float, Quote | None]] = {}  # range -> (fetched at, quote with history)
         self.rng = "1D"
-        self.title(f"{symbol} · {tr(APP_NAME)}")
-        self.geometry(UI.fit(self, 1040, 860))
-        page = tk.Frame(self, bg=C["bg"])
-        page.pack(fill="both", expand=True, padx=UI.px(28), pady=UI.px(20))
 
-        self.hero = Hero(page, symbol, self._on_range, chart_height=230)
+        page = self.inner
+        top = tk.Frame(page, bg=C["bg"])
+        top.pack(fill="x")
+        PillButton(top, tr("Back"), app.close_detail, "ghost", icon="back", padx=12, pady=5).pack(side="left")
+        for code, kind in (("BUY", "primary"), ("SELL", "outline"), ("DIVIDEND", "secondary")):
+            PillButton(top, tr(TXN_TYPES[code]), lambda c=code: app.add_txn(default_type=c, default_symbol=symbol),
+                       kind).pack(side="right", padx=(UI.px(8), 0))
+
+        self.hero = Hero(page, symbol, self._on_range, chart_height=180)
         self.hero.title.configure(font=UI.h1, fg=C["text"])
-        self.hero.pack(fill="x")
-        actions = tk.Frame(page, bg=C["bg"])
-        actions.place(relx=1.0, y=0, anchor="ne")  # top-right corner, over the hero's empty space
-        for code, kind in (("DIVIDEND", "secondary"), ("SELL", "outline"), ("BUY", "primary")):
-            PillButton(actions, tr(TXN_TYPES[code]), lambda c=code: app.add_txn(default_type=c, default_symbol=symbol,
-                                                                            parent=self), kind).pack(
-                side="right", padx=(UI.px(8), 0))
+        self.hero.pack(fill="x", pady=(UI.px(6), 0))
 
-        separator(page).pack(fill="x", pady=UI.px(16))
+        separator(page).pack(fill="x", pady=UI.px(12))
         label(page, tr("Your position"), font=UI.h2).pack(anchor="w", pady=(0, UI.px(10)))
         self.stats = StatGrid(page, [
             ("shares", tr("Shares")), ("avg", tr("Average cost")), ("value", tr("Market value")),
             ("cost", tr("Cost basis")), ("day", tr("Today's return")), ("unreal", tr("Total return")),
             ("realized", tr("Realized P/L")), ("div", tr("Dividends")),
-        ])
+        ], notes=False)
         self.stats.pack(fill="x")
-        separator(page).pack(fill="x", pady=(UI.px(4), UI.px(16)))
+        separator(page).pack(fill="x", pady=(UI.px(4), UI.px(12)))
         label(page, tr("History"), font=UI.h2).pack(anchor="w", pady=(0, UI.px(6)))
         frame, self.tree = make_tree(page, columns(self.COLUMNS))
         frame.pack(fill="both", expand=True)
         self.tree.bind("<Double-1>", self._on_double)
-        self.protocol("WM_DELETE_WINDOW", self._close)
         self.reload()
-
-    def _close(self):
-        self.app.detail_windows.discard(self)
-        self.destroy()
+        self.bind_wheel()
 
     def _on_double(self, event):
         if self.tree.identify_region(event.x, event.y) == "cell" and self.tree.focus():
-            self.app.edit_txn(int(self.tree.focus()), parent=self)
+            self.app.edit_txn(int(self.tree.focus()))
 
     def _on_range(self, rng):
         self.rng = rng
@@ -837,7 +855,7 @@ class SymbolDetail(tk.Toplevel):
         self.hero.show(self.rng, now_value, points)
 
     def _got_history(self, rng, res):
-        if not self.winfo_exists():
+        if self.app.detail is not self:  # the page was left while the chart was loading
             return
         if isinstance(res, Exception):
             self.history[rng] = (0, None)
@@ -850,8 +868,8 @@ class SymbolDetail(tk.Toplevel):
     def reload(self):
         res = self.app.result
         pos = res.positions.get(self.symbol)
-        if pos is None:
-            self._close()
+        if pos is None:  # no transactions left for this stock
+            self.app.close_detail()
             return
         price = self.app.prices.get(self.symbol)
         q = self.app.quotes.get(self.symbol)
@@ -879,17 +897,19 @@ class SymbolDetail(tk.Toplevel):
         for row in (r for r in reversed(res.rows) if self.symbol in (r.txn.symbol, r.txn.symbol2)):
             t = row.txn
             need = TYPE_FIELDS[t.type]
-            moved_out = t.type == "SYMBOL_CHANGE" and t.symbol == self.symbol  # this stock became another one
-            qty_after = ZERO if moved_out else row.qty_after
+            if t.symbol2 and t.symbol == self.symbol:  # this stock became another one, or handed one out
+                qty_after, avg_after = row.source_after
+            else:
+                qty_after, avg_after = row.qty_after, row.avg_cost_after
             tags = [] if t.type != "SELL" else ["gain" if row.realized > 0 else "loss" if row.realized < 0 else ""]
             self.tree.insert("", "end", iid=str(t.id), tags=[x for x in tags if x], values=(
                 t.date, f"{t.type_label} ({symbol_text(t)})" if t.symbol2 else t.type_label,
                 fmt_qty(t.quantity, sign=t.type == "SPLIT") if "quantity" in need else "",
-                fmt_price(t.price) if "price" in need else "",
+                price_text(t),
                 fmt_money(t.fee) if t.fee else "",
                 fmt_money(t.cash_change, sign=True) if t.cash_change else "",
                 fmt_qty(qty_after),
-                fmt_price(row.avg_cost_after) if qty_after else "-",
+                fmt_price(avg_after) if qty_after else "-",
                 fmt_money(row.realized, sign=True) if t.type == "SELL" else "",
                 t.note,
             ))
@@ -1004,10 +1024,10 @@ class SymbolSearch:
 # ======================================================================
 class App:
     HOLD_COLUMNS = [
-        ("symbol", "Symbol", 80, "w"), ("qty", "Shares", 85, "e"), ("avg", "Avg Cost", 90, "e"),
-        ("cost", "Cost Basis", 105, "e"), ("price", "Price", 85, "e"), ("day", "Day Change", 135, "e"),
+        ("symbol", "Symbol", 75, "w"), ("qty", "Shares", 80, "e"), ("avg", "Avg Cost", 85, "e"),
+        ("cost", "Cost Basis", 100, "e"), ("price", "Price", 80, "e"), ("day", "Day Change", 135, "e"),
         ("value", "Market Value", 105, "e"),
-        ("unreal", "Unrealized P/L", 110, "e"), ("pct", "P/L %", 75, "e"),
+        ("unreal", "Unrealized P/L", 110, "e"), ("pct", "P/L %", 70, "e"),
         ("realized", "Realized P/L", 100, "e"), ("div", "Dividends", 85, "e"),
     ]
     TXN_COLUMNS = [
@@ -1031,7 +1051,7 @@ class App:
         self._bg_queue: queue.Queue = queue.Queue()  # results from background threads
         self._fetching = False
         self._live_job = None
-        self.detail_windows: set[SymbolDetail] = set()
+        self.detail: SymbolDetail | None = None  # the open stock page, if any
         self.symbol_search = SymbolSearch(self)
         self.stock_rows: dict[str, StockRow] = {}
         self.last_date: str | None = None
@@ -1049,10 +1069,11 @@ class App:
             v.trace_add("write", lambda *a: self.refresh_txn_list())
 
         root.title(tr(APP_NAME))
-        root.geometry(UI.fit(root, 1320, 920))
+        root.geometry(UI.fit(root, 1440, 920))
         root.minsize(min(UI.px(1000), root.winfo_screenwidth()), min(UI.px(640), root.winfo_screenheight()))
         self._build_ui()
         root.bind_all("<Control-n>", lambda e: self.add_txn())
+        root.bind("<Escape>", lambda e: self.close_detail() if self.root.grab_current() is None else None)
         root.bind_all("<F5>", lambda e: self.refresh())
         root.protocol("WM_DELETE_WINDOW", self.quit)
 
@@ -1072,8 +1093,11 @@ class App:
         body = tk.Frame(self.root, bg=C["bg"])
         body.pack(fill="both", expand=True, padx=UI.px(28), pady=(UI.px(18), UI.px(8)))
         self._build_sidebar(body)
-        main = tk.Frame(body, bg=C["bg"])
-        main.pack(side="left", fill="both", expand=True)
+        self.main = tk.Frame(body, bg=C["bg"])  # holds the overview, or a stock's page in its place
+        self.main.pack(side="left", fill="both", expand=True)
+        self.overview = PageScroll(self.main)
+        self.overview.pack(fill="both", expand=True)
+        main = self.overview.inner
         self.hero = Hero(main, tr("Total assets"), self._on_range)
         self.hero.pack(fill="x")
         self.hero.tabs.select(self.range)
@@ -1085,6 +1109,7 @@ class App:
         ])
         self.stats.pack(fill="x")
         self._build_tabs(main)
+        self.overview.bind_wheel()
 
     def _build_topbar(self):
         bar = tk.Frame(self.root, bg=C["bg"])
@@ -1158,10 +1183,12 @@ class App:
         self.filter_symbol_box = ttk.Combobox(bar, textvariable=self.v_filter_symbol, state="readonly", width=10)
         self.filter_symbol_box.pack(side="left", padx=(UI.px(6), UI.px(14)))
         label(bar, tr("Type"), font=UI.small, color=C["muted"]).pack(side="left")
-        ttk.Combobox(bar, textvariable=self.v_filter_type, state="readonly", width=12,
-                     values=[tr(ALL), *(tr(text) for text in TXN_TYPES.values())]).pack(side="left", padx=UI.px(6))
-        PillButton(bar, tr("Clear"), self._clear_filters, "ghost", font=UI.small_bold, padx=10, pady=4).pack(
-            side="left", padx=UI.px(6))
+        self.filter_type_box = ttk.Combobox(bar, textvariable=self.v_filter_type, state="readonly", width=12,
+                                            values=[tr(ALL), *(tr(text) for text in TXN_TYPES.values())])
+        self.filter_type_box.pack(side="left", padx=UI.px(6))
+        # only shown while a filter is on; it resets the filters and deletes nothing
+        self.reset_btn = PillButton(bar, tr("Reset filters"), self._clear_filters, "ghost", font=UI.small_bold,
+                                    padx=10, pady=4)
         PillButton(bar, tr("Delete"), self.delete_selected_txn, "secondary", font=UI.small_bold, padx=12, pady=4).pack(
             side="right")
         PillButton(bar, tr("Edit"), self.edit_selected_txn, "secondary", font=UI.small_bold, padx=12, pady=4).pack(
@@ -1181,6 +1208,7 @@ class App:
                 page.pack(fill="both", expand=True)
             else:
                 page.pack_forget()
+        self.overview.refit()
 
     def _popup(self, menu: tk.Menu, widget: tk.Widget):
         menu.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height() + UI.px(4))
@@ -1240,9 +1268,8 @@ class App:
 
     def rebuild(self):
         """Apply a new theme, text size or language: rebuild every widget with the new colors, fonts and text."""
-        for w in list(self.detail_windows):
-            w.destroy()
-        self.detail_windows.clear()
+        open_sym = self.detail.symbol if self.detail else None  # stay on the same stock page afterwards
+        self.detail = None
         for child in self.root.winfo_children():
             child.destroy()
         set_theme("dark" if self.v_dark.get() else "light")
@@ -1250,6 +1277,8 @@ class App:
         self.root.title(tr(APP_NAME))
         self._build_ui()
         self.load_accounts(select_id=self.account_id)
+        if open_sym:
+            self.open_symbol(open_sym)
 
     # ------------------------------------------------------------ Accounts
     def load_accounts(self, select_id: int | None = None):
@@ -1412,6 +1441,13 @@ class App:
         self.v_filter_symbol.set(tr(ALL))
         self.v_filter_type.set(tr(ALL))
 
+    def _sync_reset_button(self):
+        filtering = tr(ALL) != self.v_filter_symbol.get() or tr(ALL) != self.v_filter_type.get()
+        if filtering and not self.reset_btn.winfo_ismapped():
+            self.reset_btn.pack(side="left", padx=UI.px(6), after=self.filter_type_box)
+        elif not filtering:
+            self.reset_btn.pack_forget()
+
     # ------------------------------------------------------------ Holdings
     def _on_hold_double(self, event):
         if self.hold_tree.identify_region(event.x, event.y) == "cell":
@@ -1425,15 +1461,27 @@ class App:
         self.open_symbol(sym)
 
     def open_symbol(self, sym: str):
-        if not sym:
+        """Show a stock's page in place of the overview (from the Stocks list or the Holdings table)."""
+        if not sym or sym not in self.result.positions:
             return
-        for w in self.detail_windows:
-            if w.symbol == sym:
-                w.deiconify()
-                w.lift()
-                w.focus_set()
-                return
-        self.detail_windows.add(SymbolDetail(self, sym))
+        if self.detail and self.detail.symbol == sym:
+            return
+        if self.detail:
+            self.detail.destroy()
+        else:
+            self.overview.pack_forget()
+        self.detail = SymbolDetail(self, self.main, sym)
+        self.detail.pack(fill="both", expand=True)
+        self.root.title(f"{sym} · {tr(APP_NAME)}")
+
+    def close_detail(self):
+        """Back to the overview."""
+        if not self.detail:
+            return
+        self.detail.destroy()
+        self.detail = None
+        self.overview.pack(fill="both", expand=True)
+        self.root.title(tr(APP_NAME))
 
     def update_prices(self):
         if not self.require_account():
@@ -1618,8 +1666,8 @@ class App:
         self.refresh_stats()
         self.refresh_sidebar()
         self.refresh_holdings()
-        for w in list(self.detail_windows):
-            w.reload()
+        if self.detail:
+            self.detail.reload()
 
     def refresh_stats(self):
         r = self.result
@@ -1732,13 +1780,14 @@ class App:
                 t.type_label,
                 symbol_text(t),
                 fmt_qty(t.quantity, sign=t.type == "SPLIT") if "quantity" in need else "",
-                fmt_price(t.price) if "price" in need else "",
+                price_text(t),
                 fmt_money(t.fee) if t.fee else "",
                 fmt_money(t.cash_change, sign=True) if t.cash_change else "-",
                 fmt_money(row.cash_after),
                 t.note,
             ))
             shown += 1
+        self._sync_reset_button()
         total = len(self.result.rows)
         self.txn_count.configure(text=tr("Showing {shown} of {total}", shown=shown, total=total) if shown != total
                                  else tr("{total} total", total=total))

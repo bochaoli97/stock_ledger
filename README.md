@@ -14,7 +14,7 @@ symbol box, to suggest matching stocks (both can be turned off).
   today's sparkline and price for every holding
 
 - Multiple accounts (e.g. a Fidelity individual account and a Roth IRA); opening cash and positions can be entered when creating one
-- Transaction types: Deposit, Withdrawal, Buy, Sell, Dividend, Interest, Fee, Shares In, Shares Out, Split, Symbol Change
+- Transaction types: Deposit, Withdrawal, Buy, Sell, Dividend, Interest, Fee, Shares In, Shares Out, Split, Symbol Change, Distribution
 - Crypto as well as stocks: record bitcoin as `BTC-USD` (ether `ETH-USD`, …), with amounts down to 0.00000001
 - Automatic calculation of cash balance (with the running balance after every transaction), shares held, average cost, cost basis, realized P/L and total dividends
 - Per-stock detail: double-click a stock to see each of its transactions, with the shares held and average cost after each one
@@ -156,8 +156,9 @@ new ones, and leave the `data` folder alone. (Rebuilding never touches a `data` 
 - 1D compares with the previous close (the dotted line). Other ranges show the gain or loss over the period
   with deposits and withdrawals left out, so adding cash doesn't count as a return.
 - Past values are rebuilt from your transactions and Yahoo's daily closes. Splits you've recorded are taken into account.
-- Click a stock in the **Stocks** list (or double-click it in Holdings) to open its own page with a price chart,
-  your position and its transaction history.
+- Click a stock in the **Stocks** list (or double-click it in Holdings) to open its own page in place of the overview,
+  with a price chart, your position and its transaction history. Click another stock in the list to switch to it;
+  **Back** or `Esc` returns to the overview.
 - **⋯ → Dark mode** switches between dark and light themes; **⋯ → Language / 语言** switches English / Chinese.
 
 ## 6. How to record things
@@ -176,19 +177,23 @@ new ones, and leave the `data` folder alone. (Rebuilding never touches a `data` 
 | Reverse split | Split, enter a negative number |
 | Stock transferred to another account | Shares Out (reduces the position at average cost, no P/L) |
 | Ticker change, or shares converted in a merger | Symbol Change: old symbol, new symbol and the new shares received (press **All** for 1-for-1); the cost basis carries over, no P/L |
-| Free warrants / rights / shares handed out (e.g. 1 warrant per share) | Shares In with the warrant's symbol, the number received and cost per share **0** (see below) |
+| Spin-off, or free warrants / rights handed out (e.g. 1 warrant per share) | Distribution: the stock, the new security's symbol, the number received and the percent of the stock's cost basis that moves to it (**0** if unknown; see below); no P/L |
 | Buy / sell crypto | Buy / Sell with the symbol `BTC-USD` etc. |
 
 **Cost basis uses the average cost method**: buys add their cost (including commissions); sells remove cost at the current average cost,
 and realized P/L = sale proceeds − cost removed. Fractional shares are supported.
 
-**Free warrants at cost 0**: your total P/L stays right, but the warrants' whole value shows as their gain while the stock
-keeps its full cost. If the company later publishes a cost basis split (IRS Form 8937, e.g. "x% to the warrants"),
-edit the two records to match: lower the stock's cost and give the warrants that share of it.
+**Cost basis moved by a Distribution**: at 0% your total P/L stays right, but the warrants' whole value shows as their
+gain while the stock keeps its full cost. If the company publishes a cost basis split (IRS Form 8937, e.g. "x% to the
+warrants"), edit the Distribution and enter that percent: the stock's cost goes down and the warrants get that share.
 
 Tips:
 - `Ctrl+N` adds a transaction; in the Transactions tab, select one and press `Enter` to edit or `Delete` to delete
-- Click a column header to sort
+- Click a column header to sort. If the window is too narrow for all the columns, the table scrolls sideways
+  (scroll bar under the table, or `Shift` + mouse wheel); if it is too short, the whole page scrolls up and down
+  (scroll bar on the right, or the mouse wheel)
+- In the Transactions tab, **Reset filters** (shown while a symbol or type filter is on) only clears the filters;
+  it never deletes transactions
 - When selling, click **All** to fill in the current number of shares held
 - Transactions on the same day are processed in the order they were entered
 

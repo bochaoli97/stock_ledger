@@ -94,9 +94,10 @@ ZH: dict[str, str] = {
     "Transactions": "交易记录",
     "Double-click a stock to open its page": "双击股票打开详情页",
     "View details": "查看详情",
+    "Back": "返回",
     "Show closed": "显示已清仓",
     "All": "全部",
-    "Clear": "清除",
+    "Reset filters": "重置筛选",
     "Delete": "删除",
     "Edit": "编辑",
     "Showing {shown} of {total}": "显示 {shown} / {total} 笔",
@@ -131,6 +132,7 @@ ZH: dict[str, str] = {
     "Shares Out": "股份转出",
     "Split": "拆股",
     "Symbol Change": "代码变更",
+    "Distribution": "派发",
     # ---- stock page
     "Your position": "我的持仓",
     "Average cost": "平均成本",
@@ -174,6 +176,16 @@ ZH: dict[str, str] = {
         "填写换得的新股数；一换一时点“全部”即可。",
     "{old_qty} shares of {symbol} become {qty} shares of {new}; cost basis {cost} carries over":
         "{symbol} {old_qty} 股换成 {new} {qty} 股；持仓成本 {cost} 一并转过去",
+    "Received symbol": "获得的代码",
+    "Quantity received": "获得数量",
+    "Cost basis moved (%)": "转移成本比例（%）",
+    "Spin-off, warrants or rights handed out on a stock you hold: the new security becomes its own "
+    "position and takes the given percent of the stock's cost basis (0 moves none). Your shares "
+    "of the stock stay the same. Does not affect cash.":
+        "分拆、派发认股权证或配股权等：新证券单独成为一个持仓，并从原股票的持仓成本中按所填比例分走一部分"
+        "（填 0 表示不转移成本）。原股票的股数不变，不影响现金。",
+    "{pct}% of {symbol}'s cost basis ({moved}) goes to {qty} {new}; {symbol} average cost becomes {avg}":
+        "{symbol} 持仓成本的 {pct}%（{moved}）转给 {new} {qty} 份；{symbol} 平均成本变为 {avg}",
     "Deposit amount": "存入金额",
     "Withdrawal amount": "取出金额",
     "Dividend amount": "股息金额",
@@ -321,6 +333,8 @@ ZH: dict[str, str] = {
     "Quantity must be greater than 0": "数量必须大于 0",
     "Price must be greater than 0": "价格必须大于 0",
     "Cost per share cannot be negative": "每股成本不能为负数",
+    "Cost basis moved must be between 0 and 100%": "转移成本比例必须在 0 到 100% 之间",
+    "{date} {symbol}: no shares held at the time of the distribution": "{date} {symbol}：派发时没有持股",
     "Fee cannot be negative": "手续费不能为负数",
     "{date} {symbol}: no shares held at the time of the split": "{date} {symbol}：拆股时没有持股",
     "{date} {symbol}: reverse split removes {removed} shares, but only {held} shares were held":
