@@ -17,6 +17,7 @@ e.g. selling 0.1 + 0.2 shares never leaves 0.0000000001 shares behind.
 
 from __future__ import annotations
 
+import calendar
 from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
@@ -103,6 +104,36 @@ def parse_date(text: str) -> str:
 
 def today() -> str:
     return date.today().isoformat()
+
+
+# Periods the transaction list can be narrowed to: code -> label (English; translated with tr() when shown).
+# A calendar year is its own code ("2026"), and "CUSTOM" takes the two dates the user types.
+PERIODS: dict[str, str] = {
+    "ALL": "All time",
+    "1M": "Past month",
+    "3M": "Past 3 months",
+    "6M": "Past 6 months",
+    "1Y": "Past year",
+}
+PERIOD_MONTHS = {"1M": 1, "3M": 3, "6M": 6, "1Y": 12}
+
+
+def add_months(day: date, n: int) -> date:
+    """`day` moved by n calendar months; a day the month does not have becomes its last (Mar 31 - 1 month = Feb 28)."""
+    year, month = divmod(day.year * 12 + day.month - 1 + n, 12)
+    month += 1
+    return day.replace(year=year, month=month, day=min(day.day, calendar.monthrange(year, month)[1]))
+
+
+def period_range(code: str, on: date | None = None) -> tuple[str | None, str | None]:
+    """First and last date (YYYY-MM-DD, both included) of a period, counted back from `on` (default: today);
+    None means no limit on that side."""
+    on = on or date.today()
+    if code in PERIOD_MONTHS:
+        return add_months(on, -PERIOD_MONTHS[code]).isoformat(), on.isoformat()
+    if len(code) == 4 and code.isdigit():
+        return f"{code}-01-01", f"{code}-12-31"
+    return None, None
 
 
 # ----------------------------------------------------------------------

@@ -7,6 +7,11 @@ Tables:
                 as Decimal, so they stay exact)
   prices        manually entered prices (shared by all accounts)
   settings      a few settings, e.g. the last opened account
+  finance_categories, finance_months, finance_entries
+                income and expenses outside the brokerage accounts (see finance.py): the categories
+                (columns), the months (rows) and what each category came to in each month, with its comment.
+                Only made once the optional Finance page is turned on (set_finance_enabled); a database whose
+                owner never uses it does not get them.
 
 Older databases are upgraded in place when opened (see _upgrade); existing records are never changed.
 """
@@ -18,6 +23,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
+from finance import EXPENSE, INCOME, FinCategory, FinEntry, FinMonth
 from ledger import Txn, to_decimal
 
 SCHEMA = """
@@ -57,6 +63,30 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 """
 
+FINANCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS finance_categories (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind     TEXT NOT NULL CHECK (kind IN ('income', 'expense')),
+    name     TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (kind, name)
+);
+
+CREATE TABLE IF NOT EXISTS finance_months (
+    month   TEXT PRIMARY KEY,
+    opening TEXT
+);
+
+CREATE TABLE IF NOT EXISTS finance_entries (
+    month       TEXT NOT NULL REFERENCES finance_months(month) ON DELETE CASCADE,
+    category_id INTEGER NOT NULL REFERENCES finance_categories(id) ON DELETE CASCADE,
+    amount      TEXT NOT NULL DEFAULT '0',
+    expr        TEXT NOT NULL DEFAULT '',
+    comment     TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (month, category_id)
+);
+"""
+
 
 def _s(d: Decimal) -> str:
     """Decimal -> text without scientific notation."""
@@ -71,6 +101,8 @@ class Storage:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
         self._upgrade()
+        if self.get_setting("finance_enabled") == "1":
+            self.conn.executescript(FINANCE_SCHEMA)
 
     def _upgrade(self) -> None:
         """Bring a database made by an older version up to date by adding what is missing."""
@@ -192,6 +224,95 @@ class Storage:
                 " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+    # ---------------- Finance (income and expenses outside the brokerage accounts) ----------------
+    def list_finance_categories(self) -> list[FinCategory]:
+        rows = self.conn.execute(  # income first, then expenses, each in the order the user arranged
+            "SELECT * FROM finance_categories ORDER BY kind = 'expense', position, id").fetchall()
+        return [FinCategory(r["id"], r["kind"], r["name"]) for r in rows]
+
+    def _add_finance_category(self, kind: str, name: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO finance_categories(kind, name, position)"
+            " VALUES (?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM finance_categories WHERE kind = ?))",
+            (kind, name, kind),
+        )
+        return cur.lastrowid
+
+    def set_finance_categories(self, kind: str, items: list[tuple[int | None, str]]) -> None:
+        """Make the categories of one kind exactly `items`, in this order: (id, name), with id None for a new one.
+        A category left out is deleted together with its amounts and comments."""
+        keep = {i for i, _ in items if i is not None}
+        with self.conn:
+            for row in self.conn.execute("SELECT id FROM finance_categories WHERE kind = ?", (kind,)).fetchall():
+                if row["id"] not in keep:
+                    self.conn.execute("DELETE FROM finance_categories WHERE id = ?", (row["id"],))
+            for cid, _ in items:  # names may be swapped or reused, so free them all first
+                if cid is not None:
+                    self.conn.execute("UPDATE finance_categories SET name = ? WHERE id = ?", (f"\x01{cid}", cid))
+            for position, (cid, name) in enumerate(items, start=1):
+                if cid is None:
+                    cid = self._add_finance_category(kind, name)
+                self.conn.execute("UPDATE finance_categories SET name = ?, position = ? WHERE id = ?",
+                                  (name, position, cid))
+
+    def finance_entry_counts(self) -> dict[int, int]:
+        """{category id: number of months that have an amount or comment for it}"""
+        rows = self.conn.execute("SELECT category_id, COUNT(*) AS n FROM finance_entries GROUP BY category_id")
+        return {r["category_id"]: r["n"] for r in rows}
+
+    def seed_finance_defaults(self, income: list[str], expenses: list[str]) -> None:
+        """Start the finance page with a few categories -- once, so they do not come back after being deleted."""
+        if self.get_setting("finance_seeded") == "1":
+            return
+        with self.conn:
+            if not self.conn.execute("SELECT 1 FROM finance_categories").fetchone():
+                for kind, names in ((INCOME, income), (EXPENSE, expenses)):
+                    for name in names:
+                        self._add_finance_category(kind, name)
+        self.set_setting("finance_seeded", "1")
+
+    def list_finance_months(self) -> list[FinMonth]:
+        months = {
+            r["month"]: FinMonth(r["month"], None if r["opening"] is None else to_decimal(r["opening"]))
+            for r in self.conn.execute("SELECT * FROM finance_months ORDER BY month")
+        }
+        for r in self.conn.execute("SELECT * FROM finance_entries"):
+            months[r["month"]].entries[r["category_id"]] = FinEntry(to_decimal(r["amount"]), r["expr"], r["comment"])
+        return list(months.values())
+
+    def _save_finance_month(self, m: FinMonth) -> None:
+        self.conn.execute(
+            "INSERT INTO finance_months(month, opening) VALUES (?, ?)"
+            " ON CONFLICT(month) DO UPDATE SET opening = excluded.opening",
+            (m.month, None if m.opening is None else _s(m.opening)),
+        )
+        self.conn.execute("DELETE FROM finance_entries WHERE month = ?", (m.month,))
+        for cid, e in m.entries.items():
+            if not e.is_empty:
+                self.conn.execute(
+                    "INSERT INTO finance_entries(month, category_id, amount, expr, comment) VALUES (?, ?, ?, ?, ?)",
+                    (m.month, cid, _s(e.amount), e.expr, e.comment),
+                )
+
+    def save_finance_month(self, m: FinMonth) -> None:
+        """Add a month, or replace the opening balance and all amounts of one that exists."""
+        with self.conn:
+            self._save_finance_month(m)
+
+    def delete_finance_month(self, month: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM finance_months WHERE month = ?", (month,))
+
+    def finance_enabled(self) -> bool:
+        return self.get_setting("finance_enabled") == "1"
+
+    def set_finance_enabled(self, on: bool) -> None:
+        """Turn the optional Finance page on (making its tables the first time) or off. Turning it off only hides
+        the page: what was entered stays in the database."""
+        if on:
+            self.conn.executescript(FINANCE_SCHEMA)
+        self.set_setting("finance_enabled", "1" if on else "0")
 
     # ---------------- Backup ----------------
     def backup_to(self, dest: str | Path) -> None:

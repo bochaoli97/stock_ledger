@@ -32,7 +32,27 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from i18n import DEFAULT_LANGUAGE, LANGUAGES, language, set_language, tr
+from finance import (
+    EXPENSE,
+    FINANCE_PERIODS,
+    INCOME,
+    FinCategory,
+    FinEntry,
+    FinMonth,
+    FinRow,
+    FinSummary,
+    add_month,
+    entry_from_text,
+    eval_amount,
+    finance_rows,
+    month_of,
+    month_range,
+    parse_month,
+    period_months,
+    summarize,
+)
 from ledger import (
+    PERIODS,
     TXN_TYPES,
     TYPE_FIELDS,
     ZERO,
@@ -46,6 +66,7 @@ from ledger import (
     fmt_price,
     fmt_qty,
     parse_date,
+    period_range,
     replay,
     to_decimal,
     today,
@@ -67,6 +88,7 @@ from ui import (
     TabBar,
     Toggle,
     color_for,
+    configure_columns,
     label,
     logo,
     make_tree,
@@ -85,6 +107,7 @@ DAY_SLOTS = 79  # 5-minute bars in a US trading day (+ the close), so today's li
 PULSE_FRESH = 20 * 60  # seconds: the 1D chart's dot pulses while its latest price is at most this old (market open)
 
 ALL = "All"  # the "no filter" choice (shown translated)
+CUSTOM_PERIOD = "Custom range…"  # the period choice that takes two typed dates (shown translated)
 ALL_ACCOUNTS = -1  # account_id of the combined view of every account (read-only)
 # chart range -> (Yahoo range, bar interval, wording for the change line); None = computed / intraday
 RANGES = {
@@ -925,6 +948,609 @@ class SymbolDetail(PageScroll):
 
 
 # ======================================================================
+# Finance: income and expenses outside the brokerage accounts, month by month
+# ======================================================================
+def cell_text(entry: FinEntry | None) -> str:
+    """What a category came to in a month; a • in front marks a cell that has a comment."""
+    text = fmt_money(entry.amount) if entry is not None and entry.amount else "-"
+    return f"• {text}" if entry is not None and entry.comment else text
+
+
+def comment_box(parent, width: int, text: str = "", rows: tuple[int, int] = (2, 6)) -> tk.Text:
+    """A multi-line text box that looks like the entry boxes, as tall as what is written in it (between the
+    fewest and most lines in `rows`). Tab moves on instead of typing a tab."""
+    box = tk.Text(parent, width=width, height=rows[0], wrap="word", font=UI.body, bg=C["chip"], fg=C["text"],
+                  insertbackground=C["text"], relief="flat", bd=0, highlightthickness=1, undo=True,
+                  highlightbackground=C["chip"], highlightcolor=C["accent"], padx=UI.px(6), pady=UI.px(4))
+    box.insert("1.0", text)
+
+    def fit(event=None):
+        lines = sum(max(1, -(-len(line) // width)) for line in box.get("1.0", "end-1c").split("\n"))
+        box.configure(height=min(max(lines, rows[0]), rows[1]))
+
+    box.bind("<KeyRelease>", fit, add="+")
+    box.bind("<Tab>", lambda e: (e.widget.tk_focusNext().focus_set(), "break")[1])
+    fit()
+    return box
+
+
+class FinanceMonthDialog(Dialog):
+    """Add or edit one month: an amount and a comment for every category, like a row of a spreadsheet."""
+
+    def __init__(self, parent, title, *, categories: list[FinCategory], initial: FinMonth | None, month: str,
+                 existing: set[str], carried, focus: int | None = None):
+        super().__init__(parent, title)
+        self.categories = categories
+        self.existing = existing  # months that are in the table already
+        self.carried = carried  # month -> the ending balance of the month before it
+        self.is_new = initial is None
+        self.v_month = tk.StringVar(value=month)
+        self.v_opening = tk.StringVar(
+            value=format(initial.opening, "f") if initial and initial.opening is not None else "")
+        self.v_amount: dict[int, tk.StringVar] = {}  # category id -> what is typed in its amount box
+        self.sums: dict[int, tk.Label] = {}  # category id -> the "= 2,501.00" next to a sum
+        self.comments: dict[int, tk.Text] = {}
+        self.amount_entries: dict[int, ttk.Entry] = {}
+
+        top = tk.Frame(self.body, bg=C["bg"])
+        top.pack(fill="x")
+        ttk.Label(top, text=tr("Month"), style="Muted.TLabel").grid(row=0, column=0, sticky="w",
+                                                                    padx=(0, UI.px(14)), pady=UI.px(5))
+        self.month_entry = ttk.Entry(top, textvariable=self.v_month, width=12)
+        self.month_entry.grid(row=0, column=1, sticky="w")
+        if not self.is_new:
+            self.month_entry.state(["readonly"])
+        ttk.Label(top, text=tr("Opening balance"), style="Muted.TLabel").grid(row=1, column=0, sticky="w",
+                                                                              padx=(0, UI.px(14)), pady=UI.px(5))
+        ttk.Entry(top, textvariable=self.v_opening, width=16, justify="right").grid(row=1, column=1, sticky="w")
+        self.opening_hint = ttk.Label(top, style="Muted.TLabel")
+        self.opening_hint.grid(row=1, column=2, sticky="w", padx=(UI.px(10), 0))
+
+        self.scroll = ScrollFrame(self.body)
+        self.scroll.pack(fill="both", expand=True, pady=(UI.px(10), 0))
+        inner = self.scroll.inner
+        for col, text in enumerate(("CATEGORY", "AMOUNT", "COMMENT")):
+            label(inner, tr(text), font=UI.small_bold, color=C["muted"]).grid(
+                row=0, column=(0, 1, 3)[col], sticky="w", padx=(0, UI.px(10)), pady=(0, UI.px(3)))
+        row, kind = 1, None
+        for c in categories:
+            if c.kind != kind:
+                kind = c.kind
+                label(inner, tr("Income" if kind == INCOME else "Expenses"), font=UI.bold).grid(
+                    row=row, column=0, columnspan=4, sticky="w", pady=(UI.px(10), UI.px(2)))
+                row += 1
+            entry = initial.entries.get(c.id) if initial else None
+            typed = (entry.expr or format(entry.amount.normalize(), "f")) if entry and entry.amount else ""
+            self.v_amount[c.id] = var = tk.StringVar(value=typed)
+            label(inner, c.name, anchor="w", justify="left", wraplength=UI.px(170)).grid(
+                row=row, column=0, sticky="nw", padx=(0, UI.px(10)), pady=(UI.px(8), 0))
+            self.amount_entries[c.id] = ttk.Entry(inner, textvariable=var, width=28, justify="right")
+            self.amount_entries[c.id].grid(row=row, column=1, sticky="nw", padx=(0, UI.px(6)), pady=UI.px(4))
+            self.sums[c.id] = label(inner, "", font=UI.small, color=C["muted"], anchor="w", width=13)
+            self.sums[c.id].grid(row=row, column=2, sticky="nw", padx=(0, UI.px(10)), pady=(UI.px(10), 0))
+            self.comments[c.id] = comment_box(inner, 34, entry.comment if entry else "")
+            self.comments[c.id].grid(row=row, column=3, sticky="we", pady=UI.px(4))
+            var.trace_add("write", lambda *a, cid=c.id: (self._update_row(cid), self._update_summary()))
+            self._update_row(c.id)
+            row += 1
+        inner.update_idletasks()
+        self.scroll.canvas.configure(width=inner.winfo_reqwidth(),
+                                     height=min(inner.winfo_reqheight(), int(self.winfo_screenheight() * 0.5)))
+
+        self.summary = label(self.body, "", font=UI.bold, anchor="w")
+        self.summary.pack(anchor="w", pady=(UI.px(12), 0))
+        ttk.Label(self.body, style="Muted.TLabel", wraplength=UI.px(560), justify="left",
+                  text=tr("An amount can be a sum, like 1250.50+1250.50; the parts are kept so you can see them later.")
+                  ).pack(anchor="w", pady=(UI.px(4), 0))
+        for v in (self.v_month, self.v_opening):
+            v.trace_add("write", lambda *a: self._update_summary())
+        self._update_summary()
+        self.add_buttons()
+        first = self.amount_entries.get(focus) or next(iter(self.amount_entries.values()), None)
+        self.initial_focus = first or self.month_entry
+        self.after(60, lambda: self._reveal(self.initial_focus))
+
+    def _reveal(self, widget) -> None:
+        """Scroll the list of categories so that the box with the focus is in view."""
+        try:
+            total, shown = self.scroll.inner.winfo_height(), self.scroll.canvas.winfo_height()
+            if widget in self.amount_entries.values() and total > shown:
+                self.scroll.canvas.yview_moveto(min(max((widget.winfo_y() - UI.px(40)) / total, 0), 1))
+        except tk.TclError:  # the dialog was closed meanwhile
+            pass
+
+    def _update_row(self, cid: int) -> None:
+        try:
+            entry = entry_from_text(self.v_amount[cid].get())
+        except ValueError:
+            self.sums[cid].configure(text=tr("Invalid"), fg=C["loss"])
+        else:
+            self.sums[cid].configure(text=f"= {fmt_money(entry.amount)}" if entry.expr else "", fg=C["muted"])
+
+    def _update_summary(self) -> None:
+        income = expenses = ZERO
+        for c in self.categories:
+            try:
+                amount = eval_amount(self.v_amount[c.id].get())
+            except ValueError:
+                continue
+            if c.kind == INCOME:
+                income += amount
+            else:
+                expenses += amount
+        try:
+            carried = self.carried(parse_month(self.v_month.get()))
+        except ValueError:
+            carried = None
+        try:
+            typed = eval_amount(self.v_opening.get()) if self.v_opening.get().strip() else None
+        except ValueError:
+            typed = None
+        opening = typed if typed is not None else carried
+        self.opening_hint.configure(
+            text=tr("Leave blank to continue from the previous month's ending balance ({value})",
+                    value=fmt_money(carried)) if carried is not None else "")
+        self.summary.configure(text=tr("Income {income} · Expenses {expenses} · Ending balance {ending}",
+                                       income=fmt_money(income), expenses=fmt_money(expenses),
+                                       ending=fmt_money(opening + income - expenses) if opening is not None else "-"))
+
+    def build_result(self):
+        month = parse_month(self.v_month.get())
+        if self.is_new and month in self.existing:
+            raise ValueError(tr("{month} already exists. Double-click it in the table to edit it.", month=month))
+        opening = eval_amount(self.v_opening.get()) if self.v_opening.get().strip() else None
+        entries = {}
+        for c in self.categories:
+            try:
+                entry = entry_from_text(self.v_amount[c.id].get(), self.comments[c.id].get("1.0", "end"))
+            except ValueError as e:
+                raise ValueError(tr("{category}: {error}", category=c.name, error=e)) from None
+            if not entry.is_empty:
+                entries[c.id] = entry
+        return FinMonth(month, opening, entries)
+
+
+class FinanceCategoriesDialog(Dialog):
+    """Add, rename, reorder and delete the income and expense categories -- the columns of the finance table."""
+
+    def __init__(self, parent, categories: list[FinCategory], used: dict[int, int]):
+        super().__init__(parent, tr("Income and Expense Categories"))
+        self.used = used  # category id -> in how many months it has an amount or a comment
+        self.items = {kind: [(c.id, c.name) for c in categories if c.kind == kind] for kind in (INCOME, EXPENSE)}
+        self.removed: list[int] = []  # ids of existing categories taken out of the lists
+        self.boxes: dict[str, tk.Listbox] = {}
+        self.v_name = {kind: tk.StringVar() for kind in (INCOME, EXPENSE)}
+
+        b = self.body
+        ttk.Label(b, style="Muted.TLabel", wraplength=UI.px(560), justify="left",
+                  text=tr("Type a name and press Add. To change a name, select it, edit the text and press Rename."),
+                  ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, UI.px(10)))
+        for col, kind in enumerate((INCOME, EXPENSE)):
+            panel = tk.Frame(b, bg=C["bg"])
+            panel.grid(row=1, column=col, sticky="n", padx=(0, UI.px(24)) if col == 0 else 0)
+            label(panel, tr("Income" if kind == INCOME else "Expenses"), font=UI.bold).pack(anchor="w", pady=(0, UI.px(4)))
+            box = tk.Listbox(panel, height=9, width=24, exportselection=False, activestyle="none", bd=0, relief="flat",
+                             highlightthickness=1, highlightbackground=C["border"], highlightcolor=C["accent"],
+                             bg=C["chip"], fg=C["text"], selectbackground=C["chip_hover"],
+                             selectforeground=C["text"], font=UI.body)
+            box.pack(fill="x")
+            box.bind("<<ListboxSelect>>", lambda e, k=kind: self._picked(k))
+            self.boxes[kind] = box
+            entry = ttk.Entry(panel, textvariable=self.v_name[kind], width=24)
+            entry.pack(fill="x", pady=(UI.px(8), UI.px(6)))
+            entry.bind("<Return>", lambda e, k=kind: (self._add(k), "break")[1])  # Enter adds, it does not save
+            bar = tk.Frame(panel, bg=C["bg"])
+            bar.pack(anchor="w")
+            for text, fn in ((tr("Add"), self._add), (tr("Rename"), self._rename), (tr("Delete"), self._delete),
+                             (tr("Up"), lambda k: self._move(k, -1)), (tr("Down"), lambda k: self._move(k, 1))):
+                ttk.Button(bar, text=text, width=6, command=lambda fn=fn, k=kind: fn(k)).pack(
+                    side="left", padx=(0, UI.px(4)))
+            self._render(kind)
+        self.add_buttons()
+        self.initial_focus = next(iter(self.boxes.values()))
+
+    def _render(self, kind: str, select: int | None = None) -> None:
+        box = self.boxes[kind]
+        box.delete(0, "end")
+        for _, name in self.items[kind]:
+            box.insert("end", name)
+        if select is not None:
+            box.selection_set(select)
+            box.see(select)
+
+    def _selected(self, kind: str) -> int | None:
+        chosen = self.boxes[kind].curselection()
+        return chosen[0] if chosen else None
+
+    def _picked(self, kind: str) -> None:
+        i = self._selected(kind)
+        if i is not None:
+            self.v_name[kind].set(self.items[kind][i][1])
+
+    def _typed_name(self, kind: str, skip: int | None = None) -> str | None:
+        """The typed name, if it is usable (not empty, not already in the list); else say why and give None."""
+        name = self.v_name[kind].get().strip()
+        if not name:
+            messagebox.showerror(tr("Invalid input"), tr("Please enter a name"), parent=self)
+        elif any(n.casefold() == name.casefold() for i, (_, n) in enumerate(self.items[kind]) if i != skip):
+            messagebox.showerror(tr("Invalid input"), tr('"{name}" is already in the list', name=name), parent=self)
+        else:
+            return name
+        return None
+
+    def _add(self, kind: str) -> None:
+        name = self._typed_name(kind)
+        if name:
+            self.items[kind].append((None, name))
+            self.v_name[kind].set("")
+            self._render(kind, len(self.items[kind]) - 1)
+
+    def _rename(self, kind: str) -> None:
+        i = self._selected(kind)
+        if i is None:
+            messagebox.showinfo(tr(APP_NAME), tr("Please select a category first."), parent=self)
+            return
+        name = self._typed_name(kind, skip=i)
+        if name:
+            self.items[kind][i] = (self.items[kind][i][0], name)
+            self._render(kind, i)
+
+    def _delete(self, kind: str) -> None:
+        i = self._selected(kind)
+        if i is None:
+            messagebox.showinfo(tr(APP_NAME), tr("Please select a category first."), parent=self)
+            return
+        cid, _ = self.items[kind].pop(i)
+        if cid is not None:
+            self.removed.append(cid)
+        self.v_name[kind].set("")
+        self._render(kind, min(i, len(self.items[kind]) - 1) if self.items[kind] else None)
+
+    def _move(self, kind: str, step: int) -> None:
+        i = self._selected(kind)
+        if i is not None and 0 <= i + step < len(self.items[kind]):
+            items = self.items[kind]
+            items[i], items[i + step] = items[i + step], items[i]
+            self._render(kind, i + step)
+
+    def build_result(self):
+        lost = sum(self.used.get(cid, 0) for cid in self.removed)
+        if lost and not messagebox.askyesno(
+            tr("Delete Categories"),
+            tr("Deleting these categories also deletes their {n} amounts and comments in the months already "
+               "entered.\n\nContinue?", n=lost),
+            parent=self, icon="warning",
+        ):
+            return None
+        return self.items
+
+
+class FinancePage(PageScroll):
+    """Income and expenses outside the brokerage accounts: one row per month, like the spreadsheet it replaces.
+    It takes the place of the whole stock view in the main window (Back or Esc returns)."""
+
+    def __init__(self, app: "App", parent):
+        super().__init__(parent)
+        self.app = app
+        self.db = app.db
+        self.db.seed_finance_defaults(
+            [tr("Salary income"), tr("Interest income"), tr("Other income")],
+            [tr("Credit card payments"), tr("Other expenses")])
+        self.categories: list[FinCategory] = self.db.list_finance_categories()
+        self.months: list[FinMonth] = []
+        self.rows: list[FinRow] = []  # every month with its totals
+        self.shown: list[FinRow] = []  # the months of the chosen period
+        self.v_period = tk.StringVar(value=tr(FINANCE_PERIODS["ALL"]))
+        self.v_from = tk.StringVar()  # the first and last month of a custom range; blank = no limit on that side
+        self.v_to = tk.StringVar()
+        self.period_codes: dict[str, str] = {}  # the period choices as shown -> their codes (see refresh)
+        self._loading = False
+
+        page = self.inner
+        top = tk.Frame(page, bg=C["bg"])
+        top.pack(fill="x")
+        PillButton(top, tr("Back"), app.close_finance, "ghost", icon="back", padx=12, pady=5).pack(side="left")
+        PillButton(top, tr("+ Add month"), self.add_month, "primary").pack(side="right", padx=(UI.px(8), 0))
+        PillButton(top, tr("Categories…"), self.edit_categories, "secondary").pack(side="right", padx=(UI.px(8), 0))
+        label(page, tr("Finance"), font=UI.h1).pack(anchor="w", pady=(UI.px(6), 0))
+        label(page, tr("Income and expenses outside your brokerage accounts, month by month"), color=C["muted"]).pack(
+            anchor="w", pady=(0, UI.px(10)))
+
+        self.stats = StatGrid(page, [("balance", tr("Balance")), ("income", tr("Income")),
+                                     ("expenses", tr("Expenses")), ("net", tr("Net change"))])
+        self.stats.pack(fill="x")
+        separator(page).pack(fill="x", pady=(UI.px(4), UI.px(12)))
+
+        bar = tk.Frame(page, bg=C["bg"])
+        bar.pack(fill="x", pady=(0, UI.px(6)))
+        label(bar, tr("Period"), font=UI.small, color=C["muted"]).pack(side="left")
+        self.period_box = ttk.Combobox(bar, textvariable=self.v_period, state="readonly", width=14)
+        self.period_box.pack(side="left", padx=(UI.px(6), UI.px(14)))
+        label(bar, tr("Double-click a month to edit it · a • marks a cell with a comment"), font=UI.small,
+              color=C["muted"]).pack(side="left")
+        PillButton(bar, tr("Delete"), self.delete_selected, "secondary", font=UI.small_bold, padx=12, pady=4).pack(
+            side="right")
+        PillButton(bar, tr("Edit"), self.edit_selected, "secondary", font=UI.small_bold, padx=12, pady=4).pack(
+            side="right", padx=UI.px(6))
+        for v in (self.v_period, self.v_from, self.v_to):
+            v.trace_add("write", lambda *a: None if self._loading else self.show())
+        # the first and last month of a custom range, in a row of their own that is only shown for that choice
+        self.range_bar = tk.Frame(page, bg=C["bg"])
+        label(self.range_bar, tr("From"), font=UI.small, color=C["muted"]).pack(side="left")
+        self.from_entry = ttk.Entry(self.range_bar, textvariable=self.v_from, width=10)
+        self.from_entry.pack(side="left", padx=(UI.px(6), UI.px(14)))
+        label(self.range_bar, tr("To"), font=UI.small, color=C["muted"]).pack(side="left")
+        self.to_entry = ttk.Entry(self.range_bar, textvariable=self.v_to, width=10)
+        self.to_entry.pack(side="left", padx=UI.px(6))
+        label(self.range_bar, tr("e.g. 2026-01; leave one blank for no limit"), font=UI.small,
+              color=C["muted"]).pack(side="left", padx=(UI.px(8), 0))
+
+        frame, self.tree = make_tree(page, self._table_columns(), sortable=False)
+        self.table_frame = frame
+        frame.pack(fill="both", expand=True)
+        self.tree.tag_configure("total", font=UI.bold)
+        self.tree.bind("<Double-1>", self._on_double)
+        self.tree.bind("<Return>", lambda e: self.edit_selected())
+        self.tree.bind("<Delete>", lambda e: self.delete_selected())
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self.show_detail())
+        self.signature = self._signature()
+
+        bottom = tk.Frame(page, bg=C["bg"])
+        bottom.pack(fill="x", pady=(UI.px(10), 0))
+        self.totals = tk.Frame(bottom, bg=C["chip"])  # what every category came to over the chosen period
+        self.totals.pack(side="left", fill="y")
+        side = tk.Frame(bottom, bg=C["chip"])
+        side.pack(side="left", fill="both", expand=True, padx=(UI.px(10), 0))
+        self.detail = tk.Text(side, height=8, wrap="word", font=UI.body, bg=C["chip"], fg=C["text"], relief="flat",
+                              bd=0, highlightthickness=0, padx=UI.px(12), pady=UI.px(8), cursor="arrow",
+                              state="disabled")
+        bar_y = ttk.Scrollbar(side, orient="vertical", command=self.detail.yview, style="Slim.Vertical.TScrollbar")
+
+        def on_scroll(first, last):  # the scroll bar only shows when the text does not fit
+            bar_y.set(first, last)
+            if float(first) <= 0 and float(last) >= 1:
+                bar_y.pack_forget()
+            elif not bar_y.winfo_ismapped():
+                bar_y.pack(side="right", fill="y")
+
+        self.detail.configure(yscrollcommand=on_scroll)
+        self.detail.pack(side="left", fill="both", expand=True)
+        self.detail.tag_configure("head", font=UI.bold)
+        self.detail.tag_configure("muted", foreground=C["muted"])
+        self.detail.tag_configure("note", lmargin1=UI.px(18), lmargin2=UI.px(18))
+        self.refresh()
+        self.bind_wheel()
+
+    # ---- the table
+    def _signature(self) -> tuple:
+        return tuple((c.id, c.kind, c.name) for c in self.categories)
+
+    def _table_columns(self) -> list[tuple[str, str, int, str]]:
+        def width(name: str) -> int:  # room for the name (a Chinese character is twice as wide), at least an amount's
+            return max(100, 24 + 8 * sum(2 if ord(ch) > 0x2E7F else 1 for ch in name))
+
+        cols = [("month", tr("Month"), 90, "w"), ("opening", tr("Opening"), 110, "e")]
+        cols += [(f"c{c.id}", c.name, width(c.name), "e") for c in self.categories if c.kind == INCOME]
+        cols.append(("income", tr("Total income"), 115, "e"))
+        cols += [(f"c{c.id}", c.name, width(c.name), "e") for c in self.categories if c.kind == EXPENSE]
+        cols += [("expenses", tr("Total expenses"), 120, "e"), ("ending", tr("Ending balance"), 125, "e")]
+        return cols
+
+    def _values(self, month: str, opening, income, expenses, ending, cell) -> list[str]:
+        """One row of the table; `cell(category)` gives the text of a category's cell."""
+        return [month, fmt_money(opening),
+                *(cell(c) for c in self.categories if c.kind == INCOME), fmt_money(income),
+                *(cell(c) for c in self.categories if c.kind == EXPENSE), fmt_money(expenses), fmt_money(ending)]
+
+    def period_choices(self) -> dict[str, str]:
+        """The choices of the Period box as shown -> their codes: the ready-made periods, each year that has
+        months (newest first), and the custom range."""
+        choices = {tr(text): code for code, text in FINANCE_PERIODS.items()}
+        choices.update({y: y for y in sorted({r.month.month[:4] for r in self.rows}, reverse=True)})
+        choices[tr(CUSTOM_PERIOD)] = "CUSTOM"
+        return choices
+
+    def month_bounds(self) -> tuple[str | None, str | None]:
+        """First and last month the page is narrowed to (None = no limit), from the Period box and, for a custom
+        range, the two month boxes -- which turn red while their text is not a usable month."""
+        code = self.period_codes.get(self.v_period.get(), "ALL")
+        if code != "CUSTOM":
+            return month_range(code, today()[:7])
+        bounds, bad = [], []
+        for var in (self.v_from, self.v_to):
+            text = var.get().strip()
+            try:
+                bounds.append(month_of(text) if text else None)
+                bad.append(False)
+            except ValueError:
+                bounds.append(None)
+                bad.append(True)
+        if bounds[0] and bounds[1] and bounds[0] > bounds[1]:  # "from" after "to" can never match anything
+            bad = [True, True]
+        for entry, flag in zip((self.from_entry, self.to_entry), bad):
+            entry.state(["invalid"] if flag else ["!invalid"])
+        return bounds[0], bounds[1]
+
+    def refresh(self, select: str | None = None) -> None:
+        """Read everything from the database again."""
+        self.categories = self.db.list_finance_categories()
+        self.months = self.db.list_finance_months()
+        self.rows = finance_rows(self.months, self.categories)
+        self._loading = True  # the Period box is rebuilt below; showing is done once, at the end
+        self.period_codes = self.period_choices()
+        self.period_box.configure(values=list(self.period_codes))
+        if self.v_period.get() not in self.period_codes:  # a year that no longer has any month
+            self.v_period.set(tr(FINANCE_PERIODS["ALL"]))
+        self._loading = False
+        self.show(select)
+
+    def show(self, select: str | None = None) -> None:
+        """Fill the table, the numbers above it and the details below it for the chosen period."""
+        tree = self.tree
+        keep = select or tree.focus() or None
+        custom = self.period_codes.get(self.v_period.get()) == "CUSTOM"
+        if custom and not self.range_bar.winfo_ismapped():
+            self.range_bar.pack(fill="x", pady=(0, UI.px(6)), before=self.table_frame)
+        elif not custom:
+            self.range_bar.pack_forget()
+        first, last_month = self.month_bounds()
+        self.shown = period_months(self.rows, first, last_month)
+        if self._signature() != self.signature:  # categories were added, renamed, moved or deleted
+            configure_columns(tree, self._table_columns(), sortable=False)
+            self.signature = self._signature()
+        tree.delete(*tree.get_children())
+        tree.hover_row = ""
+        for r in self.shown:
+            tree.insert("", "end", iid=r.month.month, values=self._values(
+                r.month.month, r.opening, r.income, r.expenses, r.ending, lambda c: cell_text(r.month.entries.get(c.id))))
+        total = summarize(self.shown)
+        if self.shown:
+            tree.insert("", "end", iid="total", tags=["total"], values=self._values(
+                tr("Total"), total.opening, total.income, total.expenses, total.ending,
+                lambda c: fmt_money(total.by_category[c.id]) if total.by_category.get(c.id) else "-"))
+        if keep and tree.exists(keep):
+            tree.selection_set(keep)
+            tree.focus(keep)
+        last = self.shown[-1].month.month if self.shown else None
+        if keep and tree.exists(keep):
+            tree.see(keep)
+        elif last:  # the newest month is the one that matters
+            tree.see(last)
+
+        n = total.months
+        month_count = plural(str(n), "{n} month", "{n} months")
+        self.stats.set("balance", usd(total.ending) if n else "-", tr("as of {month}", month=last) if n else "")
+        self.stats.set("income", usd(total.income), tr("{avg} / month", avg=usd(total.income / n)) if n else "")
+        self.stats.set("expenses", usd(total.expenses), tr("{avg} / month", avg=usd(total.expenses / n)) if n else "")
+        self.stats.set("net", usd(total.net, sign=True) if n else "-", month_count if n else "", color_for(total.net))
+        self.show_totals(total)
+        self.show_detail()
+
+    def show_totals(self, total: FinSummary) -> None:
+        """Next to the details: what each category came to over the chosen months, income on the left and expenses
+        on the right -- the figures to check against a tax return."""
+        panel = self.totals
+        for w in panel.winfo_children():
+            w.destroy()
+        pad = UI.px(12)
+        bg = C["chip"]
+        label(panel, tr("Totals for the period"), font=UI.bold, bg=bg).grid(
+            row=0, column=0, columnspan=5, sticky="w", padx=pad, pady=(UI.px(8), 0))
+        if not self.shown:
+            label(panel, tr("No months in this period."), color=C["muted"], bg=bg).grid(
+                row=1, column=0, columnspan=5, sticky="w", padx=pad, pady=(0, UI.px(8)))
+            return
+        span = tr("{first} to {last} · {months}", first=self.shown[0].month.month, last=self.shown[-1].month.month,
+                  months=plural(str(total.months), "{n} month", "{n} months"))
+        label(panel, span, font=UI.small, color=C["muted"], bg=bg).grid(
+            row=1, column=0, columnspan=5, sticky="w", padx=pad, pady=(0, UI.px(6)))
+        groups = ((INCOME, "Income", total.income, "Total income", 0), (EXPENSE, "Expenses", total.expenses,
+                                                                       "Total expenses", 3))
+        longest = max(sum(1 for c in self.categories if c.kind == kind) for kind in (INCOME, EXPENSE))
+        for kind, title, grand, grand_title, col in groups:
+            label(panel, tr(title), font=UI.small_bold, color=C["muted"], bg=bg).grid(
+                row=2, column=col, columnspan=2, sticky="w", padx=pad)
+            for i, c in enumerate(c for c in self.categories if c.kind == kind):
+                amount = total.by_category.get(c.id)
+                label(panel, c.name, bg=bg).grid(row=3 + i, column=col, sticky="w", padx=(pad, UI.px(16)))
+                label(panel, fmt_money(amount) if amount else "-", color=None if amount else C["muted"], bg=bg).grid(
+                    row=3 + i, column=col + 1, sticky="e", padx=(0, pad if col else 0))
+            tk.Frame(panel, height=1, bg=C["border"]).grid(row=3 + longest, column=col, columnspan=2, sticky="we",
+                                                           padx=pad, pady=UI.px(4))
+            label(panel, tr(grand_title), font=UI.bold, bg=bg).grid(row=4 + longest, column=col, sticky="w",
+                                                                    padx=(pad, UI.px(16)), pady=(0, UI.px(8)))
+            label(panel, fmt_money(grand), font=UI.bold, bg=bg).grid(row=4 + longest, column=col + 1, sticky="e",
+                                                                     padx=(0, pad if col else 0), pady=(0, UI.px(8)))
+        panel.columnconfigure(2, minsize=UI.px(24))
+
+    def scroll_to_latest(self) -> None:
+        """Show the newest month (called once the page has its size, so the table knows how much fits)."""
+        if self.shown:
+            self.tree.see(self.shown[-1].month.month)
+
+    def show_detail(self) -> None:
+        """Below the table: the sums and comments of the selected month."""
+        row = next((r for r in self.shown if r.month.month == self.tree.focus()), None)
+        box = self.detail
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        if row is None:
+            hint = tr("Select a month to see the sums and comments in it.") if self.rows else \
+                tr("No months yet. Click + Add month to enter the first one.")
+            box.insert("end", hint, "muted")
+        else:
+            box.insert("end", row.month.month, "head")
+            box.insert("end", "   " + tr("Opening {opening} · Income {income} · Expenses {expenses} · Ending {ending}",
+                                         opening=fmt_money(row.opening), income=fmt_money(row.income),
+                                         expenses=fmt_money(row.expenses), ending=fmt_money(row.ending)), "muted")
+            for c in self.categories:
+                e = row.month.entries.get(c.id)
+                if e is None or not (e.comment or e.expr):
+                    continue
+                box.insert("end", "\n" + c.name, "head")
+                box.insert("end", f"   {fmt_money(e.amount)}" + (f" = {e.expr}" if e.expr else ""), "muted")
+                if e.comment:
+                    box.insert("end", "\n" + e.comment, "note")
+        box.configure(state="disabled")
+
+    # ---- editing
+    def carried(self, month: str):
+        """The balance a month would start from: the ending balance of the latest month before it."""
+        return next((r.ending for r in reversed(self.rows) if r.month.month < month), ZERO)
+
+    def _on_double(self, event) -> None:
+        tree = self.tree
+        if tree.identify_region(event.x, event.y) != "cell":
+            return
+        month = tree.identify_row(event.y)
+        if not month or month == "total":
+            return
+        key = tree["columns"][int(tree.identify_column(event.x)[1:]) - 1]  # "c12" = category 12
+        self.edit_month(month, int(key[1:]) if key[1:].isdigit() and key[0] == "c" else None)
+
+    def edit_selected(self) -> None:
+        month = self.tree.focus()
+        if month and month != "total":
+            self.edit_month(month)
+        else:
+            messagebox.showinfo(tr(APP_NAME), tr("Please select a month in the table first."))
+
+    def add_month(self) -> None:
+        if not self.categories:
+            messagebox.showinfo(tr(APP_NAME), tr("Add some categories first (Categories…)."))
+            return
+        self.edit_month(None)
+
+    def edit_month(self, month: str | None, focus: int | None = None) -> None:
+        """Edit a month in the table, or (month=None) add the one after the latest."""
+        initial = next((m for m in self.months if m.month == month), None)
+        if month is None:
+            month = add_month(self.rows[-1].month.month) if self.rows else today()[:7]
+        title = tr("Edit Month" if initial else "Add Month")
+        result = FinanceMonthDialog(self.app.root, title, categories=self.categories, initial=initial, month=month,
+                                    existing={m.month for m in self.months}, carried=self.carried, focus=focus).show()
+        if result:
+            self.db.save_finance_month(result)
+            self.refresh(select=result.month)
+
+    def delete_selected(self) -> None:
+        month = self.tree.focus()
+        if not month or month == "total":
+            messagebox.showinfo(tr(APP_NAME), tr("Please select a month in the table first."))
+            return
+        if messagebox.askyesno(tr("Delete Month"), tr("Delete {month} with all its amounts and comments?", month=month)):
+            self.db.delete_finance_month(month)
+            self.refresh()
+
+    def edit_categories(self) -> None:
+        result = FinanceCategoriesDialog(self.app.root, self.categories, self.db.finance_entry_counts()).show()
+        if result:
+            for kind, items in result.items():
+                self.db.set_finance_categories(kind, items)
+            self.refresh()
+
+
+# ======================================================================
 # Sidebar row: symbol, shares, today's sparkline and a price pill
 # ======================================================================
 class StockRow(tk.Frame):
@@ -1067,6 +1693,7 @@ class App:
         self._fetching = False
         self._live_job = None
         self.detail: SymbolDetail | None = None  # the open stock page, if any
+        self.finance: FinancePage | None = None  # the open finance page, if any (it replaces the whole stock view)
         self._tabs_combined = False
         self.symbol_search = SymbolSearch(self)
         self.stock_rows: dict[str, StockRow] = {}
@@ -1077,11 +1704,16 @@ class App:
         self.v_show_closed = tk.BooleanVar(value=False)
         self.v_filter_symbol = tk.StringVar(value=tr(ALL))
         self.v_filter_type = tk.StringVar(value=tr(ALL))
+        self.v_filter_period = tk.StringVar(value=tr(PERIODS["ALL"]))
+        self.v_from = tk.StringVar()  # the dates of a custom range; blank = no limit on that side
+        self.v_to = tk.StringVar()
+        self.period_codes: dict[str, str] = {}  # the period choices as shown -> their codes (see refresh)
         self.v_live = tk.BooleanVar(value=db.get_setting("live_prices", "1") == "1")
         self.v_dark = tk.BooleanVar(value=db.get_setting("theme", "dark") == "dark")
+        self.v_finance = tk.BooleanVar(value=db.finance_enabled())  # the optional Finance page (off until turned on)
         self.v_text_size = tk.StringVar(value=text_size(db))
         self.v_language = tk.StringVar(value=language())
-        for v in (self.v_filter_symbol, self.v_filter_type):
+        for v in (self.v_filter_symbol, self.v_filter_type, self.v_filter_period, self.v_from, self.v_to):
             v.trace_add("write", lambda *a: self.refresh_txn_list())
 
         root.title(tr(APP_NAME))
@@ -1089,7 +1721,7 @@ class App:
         root.minsize(min(UI.px(1000), root.winfo_screenwidth()), min(UI.px(640), root.winfo_screenheight()))
         self._build_ui()
         root.bind_all("<Control-n>", lambda e: self.add_txn())
-        root.bind("<Escape>", lambda e: self.close_detail() if self.root.grab_current() is None else None)
+        root.bind("<Escape>", lambda e: self._on_escape())
         root.bind_all("<F5>", lambda e: self.refresh())
         root.protocol("WM_DELETE_WINDOW", self.quit)
 
@@ -1101,12 +1733,20 @@ class App:
         if self.v_live.get():
             self._live_tick()
 
+    def _on_escape(self):
+        if self.root.grab_current() is not None:  # a dialog is open: it takes the key itself
+            return
+        if self.finance:
+            self.close_finance()
+        else:
+            self.close_detail()
+
     # ------------------------------------------------------------ UI construction
     def _build_ui(self):
         self._build_topbar()
         self.status = label(self.root, "", font=UI.small, color=C["muted"], anchor="w")
         self.status.pack(side="bottom", fill="x", padx=UI.px(28), pady=(0, UI.px(8)))
-        body = tk.Frame(self.root, bg=C["bg"])
+        body = self.body = tk.Frame(self.root, bg=C["bg"])
         body.pack(fill="both", expand=True, padx=UI.px(28), pady=(UI.px(18), UI.px(8)))
         self._build_sidebar(body)
         self.main = tk.Frame(body, bg=C["bg"])  # holds the overview, or a stock's page in its place
@@ -1124,22 +1764,44 @@ class App:
             ("net", tr("Net deposits")), ("fees", tr("Fees & commissions")),
         ])
         self.stats.pack(fill="x")
+        # with the Finance page on, the all-accounts view also adds up the finance cash balance (see refresh_net_summary)
+        self.net_summary = self._build_net_summary(main) if self.v_finance.get() else None
         self._build_tabs(main)
         self.overview.bind_wheel()
+
+    def _build_net_summary(self, main) -> tuple[tk.Frame, "StatGrid"]:
+        """The block above the chart of the all-accounts view that shows the net worth including the finance cash
+        balance, next to its parts. It is packed (above the chart) only while there is something to show."""
+        frame = tk.Frame(main, bg=C["bg"])
+        grid = StatGrid(frame, [("total", tr("Net worth (all accounts)")), ("stock", tr("Stock accounts net worth")),
+                                ("cash", tr("Stock accounts cash")), ("finance", tr("Finance cash balance"))])
+        grid.pack(fill="x")
+        grid.cells["total"][0].configure(font=UI.h1)  # the sum is the headline; the three tiles after it are its parts
+        separator(frame).pack(fill="x", pady=(0, UI.px(14)))
+        return frame, grid
 
     def _build_topbar(self):
         bar = tk.Frame(self.root, bg=C["bg"])
         bar.pack(fill="x", padx=UI.px(28), pady=(UI.px(14), UI.px(10)))
         logo(bar, tr(APP_NAME)).pack(side="left")
-        self.account_btn = PillButton(bar, tr("No account"), self._account_menu, "secondary", padx=14, pady=6, caret=True)
+        self.stock_left = tk.Frame(bar, bg=C["bg"])  # the stock-only controls, hidden while the finance page is open
+        self.stock_left.pack(side="left")
+        self.account_btn = PillButton(self.stock_left, tr("No account"), self._account_menu, "secondary", padx=14, pady=6,
+                                      caret=True)
         self.account_btn.pack(side="left", padx=(UI.px(20), 0))
+        if self.v_finance.get():
+            PillButton(self.stock_left, tr("Finance"), self.open_finance, "secondary", padx=14, pady=6).pack(
+                side="left", padx=(UI.px(8), 0))
 
         self.more_btn = PillButton(bar, "", self._more_menu, "ghost", padx=10, pady=6, icon="more")
         self.more_btn.pack(side="right")
-        PillButton(bar, tr("+ Add transaction"), self.add_txn, "primary", padx=16, pady=6).pack(
+        self.stock_right = tk.Frame(bar, bg=C["bg"])
+        self.stock_right.pack(side="right")
+        PillButton(self.stock_right, tr("+ Add transaction"), self.add_txn, "primary", padx=16, pady=6).pack(
             side="right", padx=(UI.px(8), UI.px(4)))
-        PillButton(bar, tr("Update prices"), self.update_prices, "secondary", padx=14, pady=6).pack(side="right")
-        live = tk.Frame(bar, bg=C["bg"])
+        PillButton(self.stock_right, tr("Update prices"), self.update_prices, "secondary", padx=14, pady=6).pack(
+            side="right")
+        live = tk.Frame(self.stock_right, bg=C["bg"])
         live.pack(side="right", padx=UI.px(16))
         self.live_status = label(live, "", font=UI.small, color=C["muted"])
         self.live_status.pack(side="left", padx=(0, UI.px(10)))
@@ -1210,7 +1872,10 @@ class App:
         label(bar, tr("Type"), font=UI.small, color=C["muted"]).pack(side="left")
         self.filter_type_box = ttk.Combobox(bar, textvariable=self.v_filter_type, state="readonly", width=12,
                                             values=[tr(ALL), *(tr(text) for text in TXN_TYPES.values())])
-        self.filter_type_box.pack(side="left", padx=UI.px(6))
+        self.filter_type_box.pack(side="left", padx=(UI.px(6), UI.px(14)))
+        label(bar, tr("Period"), font=UI.small, color=C["muted"]).pack(side="left")
+        self.filter_period_box = ttk.Combobox(bar, textvariable=self.v_filter_period, state="readonly", width=14)
+        self.filter_period_box.pack(side="left", padx=UI.px(6))
         # only shown while a filter is on; it resets the filters and deletes nothing
         self.reset_btn = PillButton(bar, tr("Reset filters"), self._clear_filters, "ghost", font=UI.small_bold,
                                     padx=10, pady=4)
@@ -1220,7 +1885,18 @@ class App:
             side="right", padx=UI.px(6))
         self.txn_count = label(bar, "", font=UI.small, color=C["muted"])
         self.txn_count.pack(side="right", padx=UI.px(12))
+        # the two dates of a custom range, in a row of their own that is only shown for that choice
+        self.range_bar = tk.Frame(page, bg=C["bg"])
+        label(self.range_bar, tr("From"), font=UI.small, color=C["muted"]).pack(side="left")
+        self.from_entry = ttk.Entry(self.range_bar, textvariable=self.v_from, width=12)
+        self.from_entry.pack(side="left", padx=(UI.px(6), UI.px(14)))
+        label(self.range_bar, tr("To"), font=UI.small, color=C["muted"]).pack(side="left")
+        self.to_entry = ttk.Entry(self.range_bar, textvariable=self.v_to, width=12)
+        self.to_entry.pack(side="left", padx=UI.px(6))
+        label(self.range_bar, tr("e.g. 2026-09-30; leave one blank for no limit"), font=UI.small,
+              color=C["muted"]).pack(side="left", padx=(UI.px(8), 0))
         frame, self.txn_tree = make_tree(page, columns(self.TXN_COLUMNS))
+        self.txn_frame = frame
         frame.pack(fill="both", expand=True)
         self.txn_tree.bind("<Double-1>", self._on_txn_double)
         self.txn_tree.bind("<Return>", lambda e: self.edit_selected_txn())
@@ -1270,11 +1946,12 @@ class App:
 
     def _more_menu(self):
         m = style_menu(tk.Menu(self.root, tearoff=False))
-        m.add_command(label=tr("Add transaction"), accelerator="Ctrl+N", command=self.add_txn)
-        m.add_command(label=tr("Update prices…"), command=self.update_prices)
+        stock = "disabled" if self.finance else "normal"  # these act on the stock accounts
+        m.add_command(label=tr("Add transaction"), accelerator="Ctrl+N", command=self.add_txn, state=stock)
+        m.add_command(label=tr("Update prices…"), command=self.update_prices, state=stock)
         m.add_separator()
         m.add_command(label=tr("Export current account to CSV…"), command=self.export_csv,
-                      state="disabled" if self.combined else "normal")
+                      state="disabled" if self.combined or self.finance else "normal")
         m.add_command(label=tr("Back up database…"), command=self.backup)
         m.add_command(label=tr("Open data folder"), command=lambda: open_folder(self.folder))
         m.add_separator()
@@ -1287,6 +1964,7 @@ class App:
         for code, name in LANGUAGES.items():
             langs.add_radiobutton(label=name, value=code, variable=self.v_language, command=self.change_language)
         m.add_cascade(label="Language / 语言", menu=langs)  # in both languages, so it can always be found
+        m.add_checkbutton(label=tr("Finance page"), variable=self.v_finance, command=self.toggle_finance)
         m.add_separator()
         m.add_command(label=tr("User guide"), command=self.show_help)
         m.add_command(label=tr("About"), command=self.show_about)
@@ -1298,6 +1976,12 @@ class App:
         self.db.set_setting("theme", "dark" if self.v_dark.get() else "light")
         self.rebuild()
 
+    def toggle_finance(self):
+        """Turn the optional Finance page on or off: its button in the top bar, and (the first time) its tables in
+        the database. Turning it off only hides it; what was entered is kept."""
+        self.db.set_finance_enabled(self.v_finance.get())
+        self.rebuild()
+
     def change_text_size(self):
         self.db.set_setting("text_size", self.v_text_size.get())
         self.rebuild()
@@ -1307,12 +1991,14 @@ class App:
         set_language(self.v_language.get())
         self.v_filter_symbol.set(tr(ALL))  # the filters hold the old language's "All"
         self.v_filter_type.set(tr(ALL))
+        self.v_filter_period.set(tr(PERIODS["ALL"]))
         self.rebuild()
 
     def rebuild(self):
         """Apply a new theme, text size or language: rebuild every widget with the new colors, fonts and text."""
         open_sym = self.detail.symbol if self.detail else None  # stay on the same stock page afterwards
-        self.detail = None
+        was_finance = self.finance is not None and self.v_finance.get()  # ... or on the finance page (if still on)
+        self.detail = self.finance = None
         for child in self.root.winfo_children():
             child.destroy()
         set_theme("dark" if self.v_dark.get() else "light")
@@ -1322,6 +2008,8 @@ class App:
         self.load_accounts(select_id=self.account_id)
         if open_sym:
             self.open_symbol(open_sym)
+        if was_finance:
+            self.open_finance()
 
     # ------------------------------------------------------------ Accounts
     def load_accounts(self, select_id: int | None = None):
@@ -1444,7 +2132,7 @@ class App:
             return self.result.positions
 
     def add_txn(self, default_type: str | None = None, default_symbol: str = "", parent=None):
-        if self.root.grab_current() is not None or not self.require_account():
+        if self.root.grab_current() is not None or self.finance or not self.require_account():
             return
         if self.combined:
             messagebox.showinfo(tr(APP_NAME), tr("This is the combined view of all accounts. "
@@ -1502,13 +2190,46 @@ class App:
     def _clear_filters(self):
         self.v_filter_symbol.set(tr(ALL))
         self.v_filter_type.set(tr(ALL))
+        self.v_filter_period.set(tr(PERIODS["ALL"]))
+        self.v_from.set("")
+        self.v_to.set("")
 
     def _sync_reset_button(self):
-        filtering = tr(ALL) != self.v_filter_symbol.get() or tr(ALL) != self.v_filter_type.get()
+        filtering = (tr(ALL) != self.v_filter_symbol.get() or tr(ALL) != self.v_filter_type.get()
+                     or tr(PERIODS["ALL"]) != self.v_filter_period.get())
         if filtering and not self.reset_btn.winfo_ismapped():
-            self.reset_btn.pack(side="left", padx=UI.px(6), after=self.filter_type_box)
+            self.reset_btn.pack(side="left", padx=UI.px(6), after=self.filter_period_box)
         elif not filtering:
             self.reset_btn.pack_forget()
+
+    def period_choices(self) -> dict[str, str]:
+        """The choices of the Period box as shown -> their codes: the ready-made periods, each year that has
+        transactions (newest first), and the custom range."""
+        choices = {tr(text): code for code, text in PERIODS.items()}
+        choices.update({year: year for year in sorted({t.date[:4] for t in self.txns}, reverse=True)})
+        choices[tr(CUSTOM_PERIOD)] = "CUSTOM"
+        return choices
+
+    def date_bounds(self) -> tuple[str | None, str | None]:
+        """First and last date the transaction list is narrowed to (None = no limit), from the Period box and,
+        for a custom range, the two date boxes -- which turn red while their text is not a usable date."""
+        code = self.period_codes.get(self.v_filter_period.get(), "ALL")
+        if code != "CUSTOM":
+            return period_range(code)
+        bounds, bad = [], []
+        for var in (self.v_from, self.v_to):
+            text = var.get().strip()
+            try:
+                bounds.append(parse_date(text) if text else None)
+                bad.append(False)
+            except ValueError:
+                bounds.append(None)
+                bad.append(True)
+        if bounds[0] and bounds[1] and bounds[0] > bounds[1]:  # "from" after "to" can never match anything
+            bad = [True, True]
+        for entry, flag in zip((self.from_entry, self.to_entry), bad):
+            entry.state(["invalid"] if flag else ["!invalid"])
+        return bounds[0], bounds[1]
 
     # ------------------------------------------------------------ Holdings
     def _on_hold_double(self, event):
@@ -1544,6 +2265,31 @@ class App:
         self.detail = None
         self.overview.pack(fill="both", expand=True)
         self.root.title(tr(APP_NAME))
+
+    def open_finance(self):
+        """Show the finance page in place of the whole stock view."""
+        if self.finance or not self.v_finance.get() or self.root.grab_current() is not None:
+            return
+        self.body.pack_forget()
+        self.stock_left.pack_forget()
+        self.stock_right.pack_forget()
+        self.finance = FinancePage(self, self.root)
+        self.finance.pack(fill="both", expand=True, padx=UI.px(28), pady=(UI.px(18), UI.px(8)))
+        self.finance.refit()
+        self.finance.scroll_to_latest()
+        self.root.title(f"{tr('Finance')} · {tr(APP_NAME)}")
+
+    def close_finance(self):
+        """Back to the stock view (on the stock page that was open, if any)."""
+        if not self.finance:
+            return
+        self.finance.destroy()
+        self.finance = None
+        self.body.pack(fill="both", expand=True, padx=UI.px(28), pady=(UI.px(18), UI.px(8)))
+        self.stock_left.pack(side="left")
+        self.stock_right.pack(side="right")
+        self.refresh_net_summary()  # the finance balance may have changed
+        self.root.title(f"{self.detail.symbol} · {tr(APP_NAME)}" if self.detail else tr(APP_NAME))
 
     def update_prices(self):
         if not self.require_account():
@@ -1717,6 +2463,10 @@ class App:
         self.filter_symbol_box.configure(values=symbols)
         if self.v_filter_symbol.get() not in symbols:
             self.v_filter_symbol.set(tr(ALL))
+        self.period_codes = self.period_choices()
+        self.filter_period_box.configure(values=list(self.period_codes))
+        if self.v_filter_period.get() not in self.period_codes:  # a year this account has no transactions in
+            self.v_filter_period.set(tr(PERIODS["ALL"]))
         self.refresh_view()
         self.refresh_txn_list(select_txn)
 
@@ -1746,11 +2496,45 @@ class App:
         """Redraw everything that depends on prices."""
         self.refresh_chart()
         self.refresh_stats()
+        self.refresh_net_summary()
         self.refresh_sidebar()
         self.refresh_accounts()
         self.refresh_holdings()
         if self.detail:
             self.detail.reload()
+
+    def finance_balance(self) -> tuple[Decimal, str] | None:
+        """The latest month-end balance of the Finance page (all the bank money outside the brokerage accounts) and
+        its month, or None when the page is off or has no month yet."""
+        if not self.v_finance.get():
+            return None
+        rows = finance_rows(self.db.list_finance_months(), self.db.list_finance_categories())
+        return (rows[-1].ending, rows[-1].month.month) if rows else None
+
+    def refresh_net_summary(self):
+        """All-accounts view, Finance page on and in use: the net worth of everything -- the stock accounts plus the
+        finance cash balance -- with its parts side by side: stock net worth, the cash inside it, and the finance cash.
+        The chart under it stays about the stock accounts only, so its title says so."""
+        if self.net_summary is None:
+            return
+        frame, grid = self.net_summary
+        balance = self.finance_balance() if self.combined else None
+        if balance is None:
+            frame.pack_forget()
+            if self.combined:
+                self.hero.title.configure(text=tr("Net worth (all accounts)"))
+            return
+        finance, month = balance
+        r = self.result
+        stock = r.cash + valuation(r, self.prices).market_value
+        grid.set("total", usd(stock + finance), tr("= stock accounts net worth + finance cash balance"))
+        grid.set("stock", usd(stock), plural(str(len(self.accounts)), "{n} account", "{n} accounts"))
+        grid.set("cash", usd(r.cash), tr("Part of stock accounts net worth"), C["loss"] if r.cash < 0 else None)
+        grid.set("finance", usd(finance), tr("Outside brokerage accounts, as of {month}", month=month),
+                 C["loss"] if finance < 0 else None)
+        if not frame.winfo_manager():
+            frame.pack(fill="x", before=self.hero)
+        self.hero.title.configure(text=tr("Stock accounts net worth"))
 
     def refresh_stats(self):
         r = self.result
@@ -1884,12 +2668,20 @@ class App:
             return
         sym = self.v_filter_symbol.get()
         typ = self.v_filter_type.get()
+        custom = self.period_codes.get(self.v_filter_period.get()) == "CUSTOM"
+        if custom and not self.range_bar.winfo_ismapped():
+            self.range_bar.pack(fill="x", pady=(0, UI.px(6)), before=self.txn_frame)
+        elif not custom:
+            self.range_bar.pack_forget()
+        first, last = self.date_bounds()
         shown = 0
         for row in reversed(self.result.rows):  # newest first
             t = row.txn
             if sym != tr(ALL) and sym not in (t.symbol, t.symbol2):
                 continue
             if typ != tr(ALL) and t.type_label != typ:
+                continue
+            if (first and t.date < first) or (last and t.date > last):
                 continue
             need = TYPE_FIELDS[t.type]
             tree.insert("", "end", iid=str(t.id), values=(
@@ -1975,7 +2767,12 @@ class App:
             "7. Dividend reinvestment: record a Dividend, then a Buy.\n"
             "8. Stock split: record a Split with the number of shares added (total cost is unchanged).\n"
             "9. Cost basis uses the average cost method.\n"
-            "10. With two or more accounts, \"All accounts\" in the account menu adds them up (read-only).\n\n"
+            "10. With two or more accounts, \"All accounts\" in the account menu adds them up (read-only).\n"
+            "11. In the Transactions tab, the Period box narrows the list to the past month, 3 or 6 months, a year,\n"
+            "   a calendar year, or dates you type.\n"
+            "12. Optional: ⋯ → Finance page adds a Finance button with a monthly income and expense sheet for money\n"
+            "   outside your brokerage accounts. Double-click a month to edit it; every amount can carry a comment.\n"
+            "   The All accounts view then also shows the net worth including that cash balance.\n\n"
             "Data is stored in:\n{path}\nIt is backed up to the backups folder the first time you open the app each day.",
             seconds=LIVE_INTERVAL, path=self.db.path,
         ))

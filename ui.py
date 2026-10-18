@@ -149,7 +149,8 @@ class UI:
         s.configure("TSeparator", background=C["border"])
         s.configure("TEntry", fieldbackground=C["chip"], foreground=C["text"], bordercolor=C["chip"],
                     lightcolor=C["chip"], darkcolor=C["chip"], padding=cls.px(6))
-        s.map("TEntry", bordercolor=[("focus", C["accent"])], lightcolor=[("focus", C["accent"])])
+        s.map("TEntry", bordercolor=[("invalid", C["loss"]), ("focus", C["accent"])],
+              lightcolor=[("invalid", C["loss"]), ("focus", C["accent"])])  # "invalid" is set by hand, e.g. a bad date
         s.configure("TCombobox", fieldbackground=C["chip"], foreground=C["text"], background=C["chip"],
                     bordercolor=C["chip"], lightcolor=C["chip"], darkcolor=C["chip"], arrowcolor=C["muted"],
                     padding=cls.px(5))
@@ -581,7 +582,7 @@ class PageScroll(tk.Frame):
 
     With room to spare the page is as tall as the window, so a table can stretch to fill the rest; otherwise it
     is as tall as its content needs and a slim scroll bar shows. Call bind_wheel() once the page is built so the
-    mouse wheel scrolls it (a table that has rows to scroll keeps the wheel for itself)."""
+    mouse wheel scrolls it (a table or text box that has more to scroll keeps the wheel for itself)."""
 
     def __init__(self, parent, **kw):
         super().__init__(parent, bg=C["bg"], **kw)
@@ -617,7 +618,7 @@ class PageScroll(tk.Frame):
             if not self.sb.winfo_ismapped() or e.state & 0x1:  # nothing to scroll; Shift = sideways, for tables
                 return
             kind = e.widget.winfo_class()
-            if kind == "TCombobox" or (kind == "Treeview" and e.widget.yview() != (0.0, 1.0)):
+            if kind == "TCombobox" or (kind in ("Treeview", "Text") and e.widget.yview() != (0.0, 1.0)):
                 return
             self.canvas.yview_scroll(-2 if (e.num == 4 or e.delta > 0) else 2, "units")
 
@@ -842,19 +843,26 @@ class SymbolEntry(ttk.Entry):
 WHEEL_STEP = 80  # pixels a table scrolls sideways per notch of the mouse wheel
 
 
-def make_tree(parent, columns: list[tuple[str, str, int, str]]):
-    """Create a table with slim scrollbars, click-to-sort headers and row hover.
-    columns: (key, title, width, anchor w/e/center)
+def configure_columns(tree: ttk.Treeview, columns: list[tuple[str, str, int, str]], sortable: bool = True) -> None:
+    """Set (or replace) the columns of a table made by make_tree. columns: (key, title, width, anchor w/e/center)"""
+    tree.configure(columns=[c[0] for c in columns])
+    for key, text, width, anchor in columns:
+        tree.heading(key, text=text.upper(), anchor=anchor,
+                     command=(lambda k=key: sort_tree(tree, k)) if sortable else "")
+        tree.column(key, width=UI.px(width), minwidth=UI.px(width), anchor=anchor, stretch=True)
+
+
+def make_tree(parent, columns: list[tuple[str, str, int, str]], sortable: bool = True):
+    """Create a table with slim scrollbars, click-to-sort headers (unless sortable=False) and row hover.
+    columns: (key, title, width, anchor w/e/center); configure_columns() changes them later
 
     A column never gets narrower than its width: when the window is too small for all of them the table
     scrolls sideways (the scrollbar only shows then, and Shift + wheel moves it); when there is room the
     columns stretch to fill it.
     It asks for 5 rows; with more room it grows, with less the page it sits on scrolls (see PageScroll)."""
     frame = ttk.Frame(parent)
-    tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", selectmode="browse", height=5)
-    for key, text, width, anchor in columns:
-        tree.heading(key, text=text.upper(), anchor=anchor, command=lambda k=key: sort_tree(tree, k))
-        tree.column(key, width=UI.px(width), minwidth=UI.px(width), anchor=anchor, stretch=True)
+    tree = ttk.Treeview(frame, show="headings", selectmode="browse", height=5)
+    configure_columns(tree, columns, sortable)
     vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview, style="Slim.Vertical.TScrollbar")
     hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview, style="Slim.Horizontal.TScrollbar")
 

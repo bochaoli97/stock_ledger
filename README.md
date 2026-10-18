@@ -26,6 +26,11 @@ symbol box, to suggest matching stocks (both can be turned off).
 - Symbol search as you type, like Robinhood: enter a ticker or a company name ("apple", "berkshire") and pick from
   the list with the mouse or Up/Down + Enter. Stocks you hold are listed first with their share count; other matches
   come from Yahoo while live prices are on (offline, only the account's own symbols are suggested)
+- **Period filter** in the Transactions tab: the past month, 3 or 6 months, the past year, any calendar year, or a start and end date you type
+- **Finance page** (optional, off until you turn it on in the ⋯ menu) for money outside your brokerage accounts: a month-by-month
+  income and expense sheet (like a spreadsheet) with a balance that carries forward, your own income and expense categories,
+  amounts that can be written as sums (`1250.50+1250.50`), a comment on any amount, and totals for any period of months
+  (a tax year, a custom range, ...) to check against a tax return
 - Double-click to edit or delete a mistake and every number is recalculated; inconsistent entries (such as selling more than you hold) are rejected
 - Adjustable text size (More menu → Text size: Small / Standard / Large / Extra large)
 - English or Chinese interface (More menu → Language / 语言); Chinese on first launch
@@ -37,11 +42,12 @@ symbol box, to suggest matching stocks (both can be turned off).
 |---|---|
 | `app.py` | GUI and program entry point |
 | `ledger.py` | Bookkeeping logic (independent of the UI, testable on its own) |
+| `finance.py` | Monthly income and expenses outside the brokerage accounts: sums, balances, periods of months (independent of the UI, testable on its own) |
 | `storage.py` | Persistence (SQLite) |
 | `quotes.py` | Live stock quotes and price history (Yahoo Finance, no API key needed) |
 | `ui.py` | Look and feel: dark/light themes, fonts, chart and other custom widgets |
 | `i18n.py` | Interface language: English / Chinese text |
-| `test_ledger.py` | Tests for the bookkeeping logic, storage, quotes, symbol search and translations (no internet needed) |
+| `test_ledger.py` | Tests for the bookkeeping logic, the finance page, storage, quotes, symbol search and translations (no internet needed) |
 | `icon.ico` | App icon |
 | `build_exe.bat` | Builds the exe on Windows |
 | `build_from_wsl.sh` | Builds the exe from WSL with one command (calls the Windows Python) |
@@ -114,7 +120,7 @@ bash build_from_wsl.sh
 It copies the source to `C:\Users\<you>\StockLedgerBuild`, uses the Windows Python to install PyInstaller and build,
 then opens the `dist\StockLedger` folder containing `StockLedger.exe`.
 
-Option B: copy `app.py ledger.py storage.py quotes.py ui.py i18n.py icon.ico build_exe.bat` to a folder on Windows and double-click `build_exe.bat`.
+Option B: copy `app.py ledger.py finance.py storage.py quotes.py ui.py i18n.py icon.ico build_exe.bat` to a folder on Windows and double-click `build_exe.bat`.
 
 The first build downloads PyInstaller and takes about 1–2 minutes; later builds are much faster.
 
@@ -198,10 +204,44 @@ Tips:
 - Click a column header to sort. If the window is too narrow for all the columns, the table scrolls sideways
   (scroll bar under the table, or `Shift` + mouse wheel); if it is too short, the whole page scrolls up and down
   (scroll bar on the right, or the mouse wheel)
-- In the Transactions tab, **Reset filters** (shown while a symbol or type filter is on) only clears the filters;
-  it never deletes transactions
+- In the Transactions tab, **Period** narrows the list to the past month, 3 or 6 months, the past year, a calendar year
+  (the years that have transactions are listed) or **Custom range…**: type a start and/or end date (e.g. `2026-01-01`;
+  leave one blank for no limit; a box with a date that cannot be read turns red). It combines with the Symbol and Type filters,
+  and the cash balance column still shows the running balance of the whole account
+- **Reset filters** (shown while any filter is on) only clears the filters; it never deletes transactions
 - When selling, click **All** to fill in the current number of shares held
 - Transactions on the same day are processed in the order they were entered
+
+## Finance page (money outside your brokerage accounts)
+
+This page is **optional**. Until you tick **⋯ → Finance page** it does not exist: no button, no extra tables in the database, and the
+stock side looks and works exactly as before. Untick it to hide the page again; what you entered is kept.
+
+With it on, a **Finance** button next to the account menu opens a month-by-month sheet of income and expenses that have nothing to do
+with your stock accounts (salary, bank interest, credit card payments, taxes, ...). It is laid out like a spreadsheet: one row per month
+with **Opening**, your income categories, **Total income**, your expense categories, **Total expenses** and **Ending balance**
+(ending = opening + income − expenses). Each month opens with the previous month's ending balance, so the balance is the total
+of all your bank accounts; you never list the individual accounts. **Back** or `Esc` returns to the stock view.
+
+- **+ Add month** (or double-click a month to edit it): one row per category with an **amount** and a **comment**.
+  An amount may be a sum such as `1250.50+1250.50` or `120.40+85.25-10.15`; the parts are kept and shown under the table.
+  The first month needs an **Opening balance**; for later months leave it blank to continue from the month before
+  (type a figure to correct it to what your bank says).
+- **Comments**: every amount can carry a comment (several lines are fine). A **•** in front of an amount marks a cell with a comment;
+  select the month to read the comments and sums in the box under the table.
+- **Categories…**: add, rename, reorder and delete income and expense categories. Deleting one also deletes its amounts and comments.
+- **Period** picks the months to look at: all time, the past 3 or 6 months, the past year (counting this month), any calendar year
+  (the years that have months are listed), or **Custom range…** with a first and last month (`2026-01`; a whole date such as
+  `2026-03-31` counts as its month; leave one blank for no limit; a box with something that cannot be read turns red).
+  The table, the **Total** row, the numbers above the table and the **Totals for the period** box all follow it.
+- **Totals for the period** lists what every income and expense category came to over the chosen months, with total income and
+  total expenses, and the first and last month it covers -- for example choose a year, then check total income, interest income or taxes paid
+  against your tax return.
+- **All accounts view**: with the Finance page on and at least one month entered, the net worth there also counts the finance cash
+  balance (the latest month's ending balance). A block above the chart shows the parts side by side: **Net worth (all accounts)** =
+  **Stock accounts net worth** + **Finance cash balance**, and the **Stock accounts cash** (which is already part of the stock net worth,
+  not added again). The chart and the figures under it are about the stock accounts only. With the page off, or one account
+  selected, nothing changes.
 
 ## 7. FAQ
 

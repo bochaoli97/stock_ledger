@@ -78,6 +78,7 @@ ZH: dict[str, str] = {
     "Year to date": "今年以来",
     "Past year": "过去一年",
     "All time": "全部时间",
+    "Past 6 months": "过去六个月",
     "1D": "1天",
     "1W": "1周",
     "1M": "1个月",
@@ -312,7 +313,12 @@ ZH: dict[str, str] = {
     "7. Dividend reinvestment: record a Dividend, then a Buy.\n"
     "8. Stock split: record a Split with the number of shares added (total cost is unchanged).\n"
     "9. Cost basis uses the average cost method.\n"
-    "10. With two or more accounts, \"All accounts\" in the account menu adds them up (read-only).\n\n"
+    "10. With two or more accounts, \"All accounts\" in the account menu adds them up (read-only).\n"
+    "11. In the Transactions tab, the Period box narrows the list to the past month, 3 or 6 months, a year,\n"
+    "   a calendar year, or dates you type.\n"
+    "12. Optional: ⋯ → Finance page adds a Finance button with a monthly income and expense sheet for money\n"
+    "   outside your brokerage accounts. Double-click a month to edit it; every amount can carry a comment.\n"
+    "   The All accounts view then also shows the net worth including that cash balance.\n\n"
     "Data is stored in:\n{path}\nIt is backed up to the backups folder the first time you open the app each day.":
         "1. 创建账户时可以填写期初现金和持仓。\n"
         "2. 每次买入、卖出、收到股息、存入或取出资金，都点“+ 添加交易”（Ctrl+N）记一笔。\n"
@@ -327,13 +333,98 @@ ZH: dict[str, str] = {
         "7. 股息再投资：先记一笔股息，再记一笔买入。\n"
         "8. 拆股：记一笔拆股，填写增加的股数（总成本不变）。\n"
         "9. 持仓成本按平均成本法计算。\n"
-        "10. 有两个或更多账户时，账户菜单里的“全部账户”会把它们加在一起显示（只读）。\n\n"
+        "10. 有两个或更多账户时，账户菜单里的“全部账户”会把它们加在一起显示（只读）。\n"
+        "11. 在“交易记录”页，用“时间范围”可以只看过去一个月、3 个月、6 个月、一年、某个自然年，\n"
+        "   或自己输入的起止日期。\n"
+        "12. 可选功能：⋯ → 财务收支页，会多出一个“财务收支”按钮，打开按月统计的收支表，记录股票账户之外的钱。\n"
+        "   双击某个月份即可编辑，每一项金额都可以加注释。\n"
+        "   这时“全部账户”视图还会显示包含这笔现金结余的净资产。\n\n"
         "数据保存在：\n{path}\n每天第一次打开软件时会自动备份到 backups 文件夹。",
     "{app} {version}\n\nA local bookkeeping tool. Your data stays on your own computer;\n"
     "only stock symbols (and what you type into a symbol box) are sent to Yahoo Finance\n"
     "for live prices and suggestions.":
         "{app} {version}\n\n本地记账工具，数据只保存在你自己的电脑上；\n"
         "只有股票代码（以及你在代码框里输入的内容）会发送给 Yahoo Finance，\n用于获取实时价格和搜索提示。",
+    # ---- transactions: period filter
+    "Period": "时间范围",
+    "Custom range…": "自定义范围…",
+    "From": "从",
+    "To": "到",
+    "e.g. 2026-09-30; leave one blank for no limit": "例如 2026-09-30；留空表示不限",
+    # ---- finance page
+    "Finance": "财务收支",
+    "Salary income": "工资收入",
+    "Interest income": "利息收入",
+    "Other income": "杂项收入",
+    "Credit card payments": "信用卡还款",
+    "Other expenses": "杂项支出",
+    "+ Add month": "+ 添加月份",
+    "Categories…": "收支项目…",
+    "Income and expenses outside your brokerage accounts, month by month": "股票账户之外的收入与支出，按月统计",
+    "Balance": "结余",
+    "Income": "收入",
+    "Expenses": "支出",
+    "Net change": "净变化",
+    "as of {month}": "截至 {month}",
+    "{avg} / month": "月均 {avg}",
+    "Totals for the period": "所选时段合计",
+    "No months in this period.": "这个时段没有月份。",
+    "{first} to {last} · {months}": "{first} 至 {last} · {months}",
+    "No months yet. Click + Add month to enter the first one.": "还没有任何月份。点击“+ 添加月份”录入第一个月。",
+    "e.g. 2026-01; leave one blank for no limit": "例如 2026-01；留空表示不限",
+    "Finance page": "财务收支页",
+    "Stock accounts net worth": "股票账户净资产",
+    "Stock accounts cash": "股票账户现金",
+    "Finance cash balance": "财务收支现金结余",
+    "= stock accounts net worth + finance cash balance": "= 股票账户净资产 + 财务收支现金结余",
+    "Part of stock accounts net worth": "已包含在股票账户净资产中",
+    "Outside brokerage accounts, as of {month}": "股票账户之外，截至 {month}",
+    "{n} month": "{n} 个月",
+    "{n} months": "{n} 个月",
+    "Double-click a month to edit it · a • marks a cell with a comment": "双击某个月份可编辑 · 带 • 的格子有注释",
+    "Month": "月份",
+    "Opening": "起始资金",
+    "Total income": "收入合计",
+    "Total expenses": "支出合计",
+    "Ending balance": "月末结余",
+    "Select a month to see the sums and comments in it.": "选中一个月份，可在这里查看其中的算式和注释。",
+    "Opening {opening} · Income {income} · Expenses {expenses} · Ending {ending}":
+        "起始 {opening} · 收入 {income} · 支出 {expenses} · 月末 {ending}",
+    "Please select a month in the table first.": "请先在表格中选中一个月份。",
+    "Add some categories first (Categories…).": "请先添加收支项目（点“收支项目…”）。",
+    "Add Month": "添加月份",
+    "Edit Month": "编辑月份",
+    "Delete Month": "删除月份",
+    "Delete {month} with all its amounts and comments?": "删除 {month} 及其所有金额和注释？",
+    # ---- finance: month dialog
+    "Opening balance": "起始资金",
+    "CATEGORY": "项目",
+    "AMOUNT": "金额",
+    "COMMENT": "注释",
+    "Invalid": "无效",
+    "An amount can be a sum, like 1250.50+1250.50; the parts are kept so you can see them later.":
+        "金额可以填算式，例如 1250.50+1250.50；各项会保留下来，之后还能看到。",
+    "Leave blank to continue from the previous month's ending balance ({value})": "留空则承接上月月末结余（{value}）",
+    "Income {income} · Expenses {expenses} · Ending balance {ending}": "收入 {income} · 支出 {expenses} · 月末结余 {ending}",
+    "{month} already exists. Double-click it in the table to edit it.": "{month} 已经存在，请在表格中双击它进行编辑。",
+    "{category}: {error}": "{category}：{error}",
+    # ---- finance: categories dialog
+    "Income and Expense Categories": "收支项目",
+    "Type a name and press Add. To change a name, select it, edit the text and press Rename.":
+        "输入名称后点“添加”。要改名，先选中它，修改文字后点“重命名”。",
+    "Add": "添加",
+    "Rename": "重命名",
+    "Up": "上移",
+    "Down": "下移",
+    "Please enter a name": "请输入名称",
+    '"{name}" is already in the list': "“{name}”已经在列表中了",
+    "Please select a category first.": "请先选中一个项目。",
+    "Delete Categories": "删除项目",
+    "Deleting these categories also deletes their {n} amounts and comments in the months already entered.\n\n"
+    "Continue?": "删除这些项目，也会删除它们在已录入月份中的 {n} 个金额和注释。\n\n要继续吗？",
+    # ---- finance.py
+    "Invalid month, please use a format like 2026-09": "月份无效，请使用 2026-09 这样的格式",
+    "Cannot divide by zero": "不能除以零",
     # ---- ledger.py: input checks and books that don't add up
     '"{value}" is not a valid number': "“{value}”不是有效的数字",
     "Invalid date, please use a format like 2026-09-30": "日期无效，请使用 2026-09-30 这样的格式",
