@@ -43,6 +43,7 @@ symbol box, to suggest matching stocks (both can be turned off).
 | `app.py` | GUI and program entry point |
 | `ledger.py` | Bookkeeping logic (independent of the UI, testable on its own) |
 | `finance.py` | Monthly income and expenses outside the brokerage accounts: sums, balances, periods of months (independent of the UI, testable on its own) |
+| `csv_export.py` | The layout of the CSV files: which columns, in which order (independent of the UI, testable on its own) |
 | `storage.py` | Persistence (SQLite) |
 | `quotes.py` | Live stock quotes and price history (Yahoo Finance, no API key needed) |
 | `ui.py` | Look and feel: dark/light themes, fonts, chart and other custom widgets |
@@ -120,7 +121,7 @@ bash build_from_wsl.sh
 It copies the source to `C:\Users\<you>\StockLedgerBuild`, uses the Windows Python to install PyInstaller and build,
 then opens the `dist\StockLedger` folder containing `StockLedger.exe`.
 
-Option B: copy `app.py ledger.py finance.py storage.py quotes.py ui.py i18n.py icon.ico build_exe.bat` to a folder on Windows and double-click `build_exe.bat`.
+Option B: copy `app.py ledger.py finance.py csv_export.py storage.py quotes.py ui.py i18n.py icon.ico build_exe.bat` to a folder on Windows and double-click `build_exe.bat`.
 
 The first build downloads PyInstaller and takes about 1–2 minutes; later builds are much faster.
 
@@ -140,7 +141,9 @@ new ones, and leave the `data` folder alone. (Rebuilding never touches a `data` 
 - All data lives in one file: `data\stock_ledger.db`. Copying that file is a complete backup.
 - The first time you open the app each day, it backs up automatically to `data\backups\`, keeping the last 30 days.
 - **⋯ → Back up database** backs up to any location at any time (e.g. a cloud-synced folder).
-- **⋯ → Export current account to CSV** exports two tables, transactions and holdings, which open directly in Excel.
+- **⋯ → Export current account to CSV** exports three tables for the account (transactions, holdings and yearly totals), and with the
+  Finance page on, **⋯ → Export finance to CSV** exports three for the finance sheet. They open directly in Excel; see
+  [CSV files](#csv-files-for-analysis-and-for-checking-a-tax-return) for the columns.
 - To bring data entered while testing in WSL over to the exe, copy `data/stock_ledger.db` into the `data` folder next to the exe.
 
 ## 5. Live prices
@@ -242,6 +245,47 @@ of all your bank accounts; you never list the individual accounts. **Back** or `
   **Stock accounts net worth** + **Finance cash balance**, and the **Stock accounts cash** (which is already part of the stock net worth,
   not added again). The chart and the figures under it are about the stock accounts only. With the page off, or one account
   selected, nothing changes.
+
+## CSV files (for analysis and for checking a tax return)
+
+Every file is one plain table: a header row, one record per row, and no blank lines, titles or total rows in between, so a spreadsheet
+can filter, pivot and add it up as it is. Dates are `YYYY-MM-DD`, amounts are plain numbers (`1234.50`, no thousands separator), a cell
+that does not apply to a row is left empty, and the column titles follow the interface language. Files are named
+`<name>_<table>_<date>.csv` and saved as UTF-8 with a BOM, so Excel shows Chinese correctly. Everything is exported, every year:
+use the **Year** column to pick a tax year.
+
+**⋯ → Export current account to CSV** (one stock account; not available in the all-accounts view)
+
+| Table | One row per | Columns |
+|---|---|---|
+| `transactions` | transaction, oldest first | Account, Date, Year, Type, Symbol, New Symbol, Quantity, Price, Cost Moved %, Fee, Amount, Cash Change, Cash Balance, Net Proceeds, Cost Sold, Realized P/L, Note |
+| `holdings` | position (closed ones too), then the cash | Account, As Of, Symbol, Shares, Avg Cost, Cost Basis, Price, Market Value, Unrealized P/L, Realized P/L, Dividends |
+| `yearly` | calendar year with transactions | Account, Year, Deposits, Withdrawals, Dividends, Interest, Fees, Commissions, Net Proceeds, Cost Sold, Realized P/L |
+
+- **Amount** is what a deposit, withdrawal, dividend, interest or fee came to. **Cash Change** is how much the transaction moved the cash
+  (negative = out) and **Cash Balance** what was left. A split's **Quantity** is the change in shares; a distribution's **Cost Moved %**
+  is the share of the stock's cost basis handed to the new security (it is not a price).
+- Only a sale has **Net Proceeds** = quantity × price − fee (the figure a 1099-B shows), **Cost Sold** = the average cost of the shares sold
+  (a 1099-B's cost basis) and **Realized P/L** = Net Proceeds − Cost Sold. In `holdings`, **Cost Basis** is the cost of what you hold now.
+- The last row of `holdings` is the cash (its **Market Value** is the cash balance), so the Market Value column adds up to the account's
+  value; stocks without a price have no market value. Prices are the ones the app has on **As Of**, the day of the export.
+- `yearly` is what to check against 1099-DIV (**Dividends**), 1099-INT (**Interest**) and 1099-B (**Net Proceeds**, **Cost Sold**,
+  **Realized P/L**). **Fees** are account fees (Fee transactions); **Commissions** are the fees paid on buys and sells.
+  The average cost method has no per-lot purchase dates, so this is not a Form 8949 by itself.
+
+**⋯ → Export finance to CSV** (shown when the Finance page is on; expenses are positive numbers)
+
+| Table | One row per | Columns |
+|---|---|---|
+| `monthly` | month | Year, Month, Opening, *your income categories*, Total income, *your expense categories*, Total expenses, Ending balance |
+| `yearly` | calendar year with months | Year, Months, Opening, *your income categories*, Total income, *your expense categories*, Total expenses, Ending balance |
+| `entries` | amount entered | Year, Month, Type (Income / Expense), Category, Amount, Calculation, Comment |
+
+- `monthly` is the sheet as it looks on the page. `yearly` has the same columns, summed over the year: **Months** is the number of months
+  entered (12 = the whole year), **Opening** is the first month's and **Ending balance** the last month's. A category without any amount
+  that year is left empty.
+- `entries` is the same data one amount per row, with the sum you typed (`4000+4000`) and the comment -- for pivoting by category,
+  or to look up what a comment said (for example every payment marked as tax).
 
 ## 7. FAQ
 

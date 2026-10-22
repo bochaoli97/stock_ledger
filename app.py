@@ -15,7 +15,6 @@ Files:
 
 from __future__ import annotations
 
-import csv
 import os
 import platform
 import queue
@@ -31,6 +30,7 @@ from decimal import Decimal
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from csv_export import finance_tables, stock_tables, write_tables
 from i18n import DEFAULT_LANGUAGE, LANGUAGES, language, set_language, tr
 from finance import (
     EXPENSE,
@@ -1952,6 +1952,8 @@ class App:
         m.add_separator()
         m.add_command(label=tr("Export current account to CSV…"), command=self.export_csv,
                       state="disabled" if self.combined or self.finance else "normal")
+        if self.v_finance.get():
+            m.add_command(label=tr("Export finance to CSV…"), command=self.export_finance_csv)
         m.add_command(label=tr("Back up database…"), command=self.backup)
         m.add_command(label=tr("Open data folder"), command=lambda: open_folder(self.folder))
         m.add_separator()
@@ -2713,34 +2715,23 @@ class App:
         folder = filedialog.askdirectory(title=tr("Choose a folder to export to"))
         if not folder:
             return
-        stamp = datetime.now().strftime("%Y%m%d")
-        base = safe_filename(acc["name"])
-        txn_file = Path(folder) / f"{base}_transactions_{stamp}.csv"
-        hold_file = Path(folder) / f"{base}_holdings_{stamp}.csv"
-        # utf-8-sig: lets Excel display non-ASCII text (e.g. notes) correctly
-        with open(txn_file, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow([tr(h) for h in ("Date", "Type", "Symbol", "Quantity", "Price", "Fee", "Amount", "Cash Change",
-                                        "Cash Balance", "Note", "New Symbol")])
-            for row in self.result.rows:
-                t = row.txn
-                w.writerow([t.date, t.type_label, t.symbol, format(t.quantity, "f"), format(t.price, "f"),
-                            format(t.fee, "f"), format(t.amount, "f"), fmt_money(t.cash_change).replace(",", ""),
-                            fmt_money(row.cash_after).replace(",", ""), t.note, t.symbol2])
-        with open(hold_file, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow([tr(h) for h in ("Symbol", "Shares", "Avg Cost", "Cost Basis", "Price", "Market Value",
-                                        "Realized P/L", "Dividends")])
-            for p in self.result.all_positions:
-                price = self.prices.get(p.symbol)
-                mv = p.quantity * price if (price is not None and p.is_open) else None
-                w.writerow([p.symbol, format(p.quantity, "f"), fmt_price(p.avg_cost).replace(",", ""),
-                            fmt_money(p.cost).replace(",", ""), format(price, "f") if price is not None else "",
-                            fmt_money(mv).replace(",", "") if mv is not None else "",
-                            fmt_money(p.realized).replace(",", ""), fmt_money(p.dividends).replace(",", "")])
-            w.writerow([])
-            w.writerow([tr("Cash Balance"), fmt_money(self.result.cash).replace(",", "")])
-        messagebox.showinfo(tr(APP_NAME), tr("Exported:\n{files}", files=f"{txn_file.name}\n{hold_file.name}"))
+        tables = stock_tables(acc["name"], self.result, self.prices, today())
+        self._exported(write_tables(folder, safe_filename(acc["name"]), datetime.now().strftime("%Y%m%d"), tables))
+
+    def export_finance_csv(self):
+        categories = self.db.list_finance_categories()
+        rows = finance_rows(self.db.list_finance_months(), categories)
+        if not rows:
+            messagebox.showinfo(tr(APP_NAME), tr("There are no months to export yet."))
+            return
+        folder = filedialog.askdirectory(title=tr("Choose a folder to export to"))
+        if not folder:
+            return
+        tables = finance_tables(rows, categories)
+        self._exported(write_tables(folder, "finance", datetime.now().strftime("%Y%m%d"), tables))
+
+    def _exported(self, files: list[Path]):
+        messagebox.showinfo(tr(APP_NAME), tr("Exported:\n{files}", files="\n".join(f.name for f in files)))
 
     def backup(self):
         path = filedialog.asksaveasfilename(

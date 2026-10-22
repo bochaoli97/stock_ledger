@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 WIN_PROFILE=$(cd /mnt/c && cmd.exe /c "echo %USERPROFILE%" | tr -d '\r')
 BUILD_DIR="$(wslpath "$WIN_PROFILE")/StockLedgerBuild"
 mkdir -p "$BUILD_DIR"
-cp app.py ledger.py finance.py storage.py quotes.py ui.py i18n.py icon.ico build_exe.bat "$BUILD_DIR/"
+cp app.py ledger.py finance.py csv_export.py storage.py quotes.py ui.py i18n.py icon.ico build_exe.bat "$BUILD_DIR/"
 echo "Source copied to $WIN_PROFILE\\StockLedgerBuild"
 
 cd "$BUILD_DIR"

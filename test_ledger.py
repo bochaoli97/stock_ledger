@@ -6,6 +6,7 @@ No test touches the internet: the Yahoo calls are replaced by canned responses.
 """
 
 import ast
+import csv
 import io
 import json
 import string
@@ -17,6 +18,23 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from csv_export import (
+    ENTRY_HEADERS,
+    FINANCE_YEARLY_HEADERS,
+    HOLDING_HEADERS,
+    MONTHLY_HEADERS,
+    TXN_HEADERS,
+    YEARLY_HEADERS,
+    entry_table,
+    finance_tables,
+    finance_yearly_table,
+    holding_table,
+    monthly_table,
+    stock_tables,
+    transaction_table,
+    write_tables,
+    yearly_table,
+)
 from finance import (
     FINANCE_PERIODS,
     FinCategory,
@@ -833,6 +851,166 @@ def test_summarize_months():
     assert s.by_category == {1: 800, 2: 12, 3: 100, 4: 50}
     empty = summarize([])
     assert (empty.months, empty.income, empty.opening, empty.ending, empty.by_category) == (0, 0, None, None, {})
+
+
+# ----------------------------------------------------------------------
+# CSV files
+# ----------------------------------------------------------------------
+def _records(table):
+    """A table as (header, [{title: cell}, ...])."""
+    header, rows = table
+    assert all(len(r) == len(header) for r in rows)  # a plain rectangle: nothing a spreadsheet would misplace
+    return header, [dict(zip(header, r)) for r in rows]
+
+
+def test_csv_transactions_table():
+    res = replay(sample_txns())
+    header, rows = _records(transaction_table("Main", res))
+    assert header == list(TXN_HEADERS) and len(rows) == len(res.rows)
+    assert [r["Account"] for r in rows] == ["Main"] * len(rows) and rows[0]["Year"] == "2026"
+    deposit, shares_in, buy, _, sell = rows[0], rows[1], rows[2], rows[3], rows[4]
+    # a type leaves out what it does not use, instead of writing zeros
+    assert (deposit["Date"], deposit["Type"], deposit["Symbol"], deposit["Quantity"], deposit["Price"], deposit["Fee"]) == (
+        "2026-01-02", "Deposit", "", "", "", "")
+    assert (deposit["Amount"], deposit["Cash Change"], deposit["Cash Balance"], deposit["Net Proceeds"]) == (
+        "10000.00", "10000.00", "10000.00", "")
+    assert (shares_in["Quantity"], shares_in["Price"], shares_in["Cash Change"]) == ("10", "150", "0.00")
+    assert (buy["Quantity"], buy["Price"], buy["Fee"], buy["Amount"], buy["Cash Change"], buy["Cash Balance"]) == (
+        "10", "170", "1.00", "", "-1701.00", "8299.00")
+    assert (buy["Net Proceeds"], buy["Cost Sold"], buy["Realized P/L"]) == ("", "", "")  # only a sale has these
+    # a sale: 5 x 200 - 1 fee; 5 of the 20 shares held at an average cost of 160.05
+    assert (sell["Net Proceeds"], sell["Cost Sold"], sell["Realized P/L"]) == ("999.00", "800.25", "198.75")
+    assert (sell["Cash Change"], sell["Fee"]) == ("999.00", "1.00")
+    for r in rows:
+        if r["Type"] == "Sell":
+            assert D(r["Net Proceeds"]) - D(r["Cost Sold"]) == D(r["Realized P/L"])
+    assert rows[-1]["Cash Balance"] == f"{res.cash:.2f}"
+    split = next(r for r in rows if r["Type"] == "Split")
+    assert (split["Quantity"], split["Cash Change"]) == ("45", "0.00")
+    dividend = next(r for r in rows if r["Type"] == "Dividend")
+    assert (dividend["Symbol"], dividend["Amount"], dividend["Quantity"]) == ("AAPL", "3.75", "")
+
+
+def test_csv_transactions_table_special_types():
+    t = [Txn(date="2026-01-02", type="SHARES_IN", symbol="OLD", quantity=D(100), price=D(10), id=1),
+         Txn(date="2026-02-01", type="DISTRIBUTION", symbol="OLD", symbol2="NEW", quantity=D(25), price=D(20), id=2),
+         Txn(date="2026-03-01", type="SYMBOL_CHANGE", symbol="NEW", symbol2="NEWER", quantity=D(25), id=3,
+             note='renamed, "quoted"')]
+    _, rows = _records(transaction_table("A", replay(t)))
+    shares_in, dist, change = rows
+    assert (shares_in["Price"], shares_in["Cost Moved %"]) == ("10", "")
+    # the percent of cost a distribution hands over is not a price
+    assert (dist["Symbol"], dist["New Symbol"], dist["Quantity"], dist["Price"], dist["Cost Moved %"]) == (
+        "OLD", "NEW", "25", "", "20")
+    assert (change["Symbol"], change["New Symbol"], change["Quantity"], change["Cost Moved %"], change["Note"]) == (
+        "NEW", "NEWER", "25", "", 'renamed, "quoted"')
+
+
+def test_csv_holdings_table():
+    res = replay(sample_txns())
+    header, rows = _records(holding_table("Main", res, {"AAPL": D("210.5"), "MSFT": D(400)}, "2026-07-01"))
+    assert header == list(HOLDING_HEADERS)
+    aapl, msft, cash = rows  # open positions first, closed ones after; the cash is the last row
+    assert (aapl["Account"], aapl["As Of"], aapl["Symbol"], aapl["Shares"]) == ("Main", "2026-07-01", "AAPL", "50")
+    assert (aapl["Avg Cost"], aapl["Cost Basis"], aapl["Price"]) == ("40.0125", "2000.63", "210.5")
+    assert (aapl["Market Value"], aapl["Unrealized P/L"], aapl["Realized P/L"], aapl["Dividends"]) == (
+        "10525.00", "8524.38", "198.75", "3.75")
+    # a closed position keeps what it earned, has no price or average cost
+    assert (msft["Shares"], msft["Avg Cost"], msft["Cost Basis"], msft["Price"], msft["Market Value"]) == (
+        "0", "", "0.00", "", "")
+    assert (msft["Unrealized P/L"], msft["Realized P/L"]) == ("", "-100.00")
+    assert (cash["Symbol"], cash["Market Value"], cash["Shares"], cash["Cost Basis"]) == ("Cash", "8192.98", "", "")
+    assert f"{res.cash:.2f}" == "8192.98"
+    _, unpriced = _records(holding_table("Main", res, {}, "2026-07-01"))
+    assert (unpriced[0]["Price"], unpriced[0]["Market Value"], unpriced[0]["Unrealized P/L"]) == ("", "", "")
+
+
+def test_csv_yearly_table_adds_up_by_year():
+    res = replay(txns(
+        ("2025-12-30", "DEPOSIT", "", 0, 0, 0, 5000),
+        ("2025-12-31", "BUY", "X", 10, 100, 2, 0),
+        ("2026-01-10", "SELL", "X", 4, 120, 1, 0),
+        ("2026-02-01", "DIVIDEND", "X", 0, 0, 0, 5),
+        ("2026-03-01", "INTEREST", "", 0, 0, 0, 2),
+        ("2026-04-01", "FEE", "", 0, 0, 0, 7),
+        ("2026-05-01", "WITHDRAW", "", 0, 0, 0, 100),
+        ("2026-06-01", "SELL", "X", 6, 90, 1, 0),
+    ))
+    header, rows = _records(yearly_table("Main", res))
+    assert header == list(YEARLY_HEADERS)
+    y25, y26 = rows  # oldest year first
+    assert (y25["Account"], y25["Year"], y25["Deposits"], y25["Commissions"], y25["Realized P/L"]) == (
+        "Main", "2025", "5000.00", "2.00", "0.00")
+    assert (y26["Year"], y26["Deposits"], y26["Withdrawals"], y26["Dividends"], y26["Interest"], y26["Fees"]) == (
+        "2026", "0.00", "100.00", "5.00", "2.00", "7.00")
+    # sold 4 (cost 400.80) and 6 (cost 601.20): proceeds 479 and 539
+    assert (y26["Commissions"], y26["Net Proceeds"], y26["Cost Sold"], y26["Realized P/L"]) == (
+        "2.00", "1018.00", "1002.00", "16.00")
+    assert D(y26["Net Proceeds"]) - D(y26["Cost Sold"]) == D(y26["Realized P/L"]) == res.realized
+    assert _records(yearly_table("Main", replay([])))[1] == []
+
+
+def test_csv_stock_tables_follow_the_language():
+    res = replay(sample_txns())
+    try:
+        i18n.set_language("zh")
+        tables = stock_tables("主账户", res, {}, "2026-07-01")
+        assert list(tables) == ["transactions", "holdings", "yearly"]
+        assert tables["transactions"][0][:5] == ["账户", "日期", "年度", "类型", "代码"]
+        assert tables["transactions"][1][0][3] == "存入" and tables["holdings"][1][-1][2] == "现金"
+        assert tables["yearly"][0][:4] == ["账户", "年度", "存入", "取出"]
+    finally:
+        i18n.set_language("en")
+
+
+def test_csv_finance_tables():
+    cats, months = _finance_fixture()
+    months.append(FinMonth("2026-01", None, {1: FinEntry(D(10))}))
+    rows = finance_rows(months, cats)
+    header, monthly = _records(monthly_table(rows, cats))
+    assert header == ["Year", "Month", "Opening", "Salary", "Interest", "Total income", "Card", "Tax", "Total expenses",
+                      "Ending balance"]
+    assert [list(r.values()) for r in monthly] == [
+        ["2025", "2025-01", "1000.00", "300.00", "5.00", "305.00", "", "50.00", "50.00", "1255.00"],
+        ["2025", "2025-02", "1255.00", "500.00", "", "500.00", "100.00", "", "100.00", "1655.00"],
+        ["2025", "2025-03", "2000.00", "", "", "0.00", "", "", "0.00", "2000.00"],  # a typed opening balance
+        ["2025", "2025-04", "2000.00", "", "7.00", "7.00", "", "", "0.00", "2007.00"],
+        ["2026", "2026-01", "2007.00", "10.00", "", "10.00", "", "", "0.00", "2017.00"],
+    ]
+    header, yearly = _records(finance_yearly_table(rows, cats))
+    assert header == ["Year", "Months", "Opening", "Salary", "Interest", "Total income", "Card", "Tax", "Total expenses",
+                      "Ending balance"]
+    assert [list(r.values()) for r in yearly] == [
+        ["2025", "4", "1000.00", "800.00", "12.00", "812.00", "100.00", "50.00", "150.00", "2007.00"],
+        ["2026", "1", "2007.00", "10.00", "", "10.00", "", "", "0.00", "2017.00"],
+    ]
+    # a year's row is the sum of its months, and carries the first opening and last ending balance
+    jan_to_apr = summarize(rows[:4])
+    assert (D(yearly[0]["Total income"]), D(yearly[0]["Total expenses"])) == (jan_to_apr.income, jan_to_apr.expenses)
+    header, entries = _records(entry_table(rows, cats))
+    assert header == list(ENTRY_HEADERS)
+    assert [(r["Month"], r["Type"], r["Category"], r["Amount"]) for r in entries] == [
+        ("2025-01", "Income", "Salary", "300.00"), ("2025-01", "Income", "Interest", "5.00"),
+        ("2025-01", "Expense", "Tax", "50.00"), ("2025-02", "Income", "Salary", "500.00"),
+        ("2025-02", "Expense", "Card", "100.00"), ("2025-04", "Income", "Interest", "7.00"),
+        ("2026-01", "Income", "Salary", "10.00")]
+    assert (entries[0]["Year"], entries[0]["Calculation"], entries[4]["Comment"], entries[1]["Comment"]) == (
+        "2025", "100+200", "x", "")
+    assert list(finance_tables(rows, cats)) == ["monthly", "yearly", "entries"]
+    assert _records(monthly_table([], cats))[1] == [] and _records(entry_table([], cats))[1] == []
+    assert MONTHLY_HEADERS == ("Year", "Month") and FINANCE_YEARLY_HEADERS == ("Year", "Months")
+
+
+def test_csv_files_open_in_excel():
+    header, rows = ["Name", "Note"], [["a", "line one\nline two"], ["中文, \"quoted\"", ""]]
+    with tempfile.TemporaryDirectory() as tmp:
+        files = write_tables(tmp, "base", "20261022", {"one": (header, rows), "two": (["C"], [])})
+        assert [f.name for f in files] == ["base_one_20261022.csv", "base_two_20261022.csv"]
+        assert files[0].read_bytes().startswith(b"\xef\xbb\xbf")  # a BOM, so Excel reads it as UTF-8
+        with open(files[0], newline="", encoding="utf-8-sig") as f:
+            assert list(csv.reader(f)) == [header, *rows]
+        with open(files[1], newline="", encoding="utf-8-sig") as f:
+            assert list(csv.reader(f)) == [["C"]]
 
 
 # ----------------------------------------------------------------------
@@ -2184,6 +2362,110 @@ def test_finance_categories_dialog():
         _close_gui(root)
 
 
+def _more_menu_commands(a):
+    """{label: state} of the commands in the ⋯ menu."""
+    with mock.patch.object(a, "_popup") as popup:
+        a._more_menu()
+    menu = popup.call_args[0][0]
+    return {menu.entrycget(i, "label"): menu.entrycget(i, "state")
+            for i in range(menu.index("end") + 1) if menu.type(i) == "command"}
+
+
+def _read_csv(path):
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return list(csv.reader(f))
+
+
+def test_exporting_the_stock_account_to_csv():
+    import app
+
+    win = _gui_window()
+    if win is None:
+        return
+    root, a = win
+    try:
+        assert _more_menu_commands(a)["Export current account to CSV…"] == "normal"
+        assert "Export finance to CSV…" not in _more_menu_commands(a)  # the menu is as it was until Finance is turned on
+        folder = tempfile.mkdtemp()
+        with mock.patch.object(app.filedialog, "askdirectory", return_value=folder), \
+                mock.patch.object(app.messagebox, "showinfo") as info:
+            a.export_csv()
+        stamp = datetime.now().strftime("%Y%m%d")
+        names = [f"Test_{table}_{stamp}.csv" for table in ("transactions", "holdings", "yearly")]
+        assert sorted(p.name for p in Path(folder).iterdir()) == sorted(names)
+        assert info.call_args[0][1] == "Exported:\n" + "\n".join(names)
+        txn_rows = _read_csv(Path(folder) / names[0])
+        assert txn_rows[0] == list(TXN_HEADERS) and [r[:4] for r in txn_rows[1:]] == [
+            ["Test", "2026-01-02", "2026", "Deposit"], ["Test", "2026-01-05", "2026", "Buy"],
+            ["Test", "2026-01-06", "2026", "Buy"]]
+        hold_rows = _read_csv(Path(folder) / names[1])
+        assert [r[2] for r in hold_rows[1:]] == ["AAPL", "SKYD", "Cash"]  # the cash is a row of the table, not a footer
+        assert hold_rows[-1][7] == f"{a.result.cash:.2f}" and hold_rows[1][1] == date.today().isoformat()
+        assert _read_csv(Path(folder) / names[2])[1][:3] == ["Test", "2026", "20000.00"]
+
+        with mock.patch.object(app.filedialog, "askdirectory", return_value=""), \
+                mock.patch.object(app.messagebox, "showinfo") as info:  # cancelling the folder box writes nothing
+            a.export_csv()
+        assert not info.called and len(list(Path(folder).iterdir())) == 3
+    finally:
+        _close_gui(root)
+
+
+def test_exporting_the_finance_page_to_csv():
+    import app
+
+    ready = _finance_page()
+    if ready is None:
+        return
+    root, a, f, ids = ready
+    try:
+        # the finance export is in the menu, also on the finance page, where the stock account cannot be exported
+        assert _more_menu_commands(a)["Export finance to CSV…"] == "normal"
+        assert _more_menu_commands(a)["Export current account to CSV…"] == "disabled"
+        a.close_finance()
+        root.update()
+        assert _more_menu_commands(a)["Export finance to CSV…"] == "normal"
+        assert _more_menu_commands(a)["Export current account to CSV…"] == "normal"
+
+        folder = tempfile.mkdtemp()
+        with mock.patch.object(app.filedialog, "askdirectory", return_value=folder), \
+                mock.patch.object(app.messagebox, "showinfo") as info:
+            a.export_finance_csv()
+        stamp = datetime.now().strftime("%Y%m%d")
+        names = [f"finance_{table}_{stamp}.csv" for table in ("monthly", "yearly", "entries")]
+        assert sorted(p.name for p in Path(folder).iterdir()) == sorted(names)
+        assert info.call_args[0][1] == "Exported:\n" + "\n".join(names)
+        monthly = _read_csv(Path(folder) / names[0])
+        assert monthly[0] == ["Year", "Month", "Opening", "Salary income", "Interest income", "Other income",
+                              "Total income", "Credit card payments", "Other expenses", "Total expenses", "Ending balance"]
+        assert monthly[1:] == [
+            ["2025", "2025-12", "1000.00", "8000.00", "", "", "8000.00", "200.00", "", "200.00", "8800.00"],
+            ["2026", "2026-01", "8800.00", "9000.00", "12.50", "", "9012.50", "", "300.00", "300.00", "17512.50"]]
+        yearly = _read_csv(Path(folder) / names[1])
+        assert [r[:3] for r in yearly] == [["Year", "Months", "Opening"], ["2025", "1", "1000.00"], ["2026", "1", "8800.00"]]
+        entries = _read_csv(Path(folder) / names[2])
+        assert entries[0] == list(ENTRY_HEADERS) and len(entries) == 6
+        assert entries[1] == ["2025", "2025-12", "Income", "Salary income", "8000.00", "4000+4000", "two paychecks"]
+        assert entries[-1] == ["2026", "2026-01", "Expense", "Other expenses", "300.00", "", "moved to Fidelity\nfor SKYD"]
+
+        with mock.patch.object(app.filedialog, "askdirectory", return_value=""), \
+                mock.patch.object(app.messagebox, "showinfo") as info:
+            a.export_finance_csv()
+        assert not info.called and len(list(Path(folder).iterdir())) == 3
+
+        for m in a.db.list_finance_months():  # nothing entered: say so instead of writing empty files
+            a.db.delete_finance_month(m.month)
+        with mock.patch.object(app.filedialog, "askdirectory") as ask, mock.patch.object(app.messagebox, "showinfo") as info:
+            a.export_finance_csv()
+        assert not ask.called and info.call_args[0][1] == "There are no months to export yet."
+
+        a.v_finance.set(False)  # the page turned off: its export goes too
+        a.toggle_finance()
+        assert "Export finance to CSV…" not in _more_menu_commands(a)
+    finally:
+        _close_gui(root)
+
+
 def test_finance_page_in_chinese():
     import i18n
 
@@ -2225,7 +2507,7 @@ def _translated_texts() -> set[str]:
         return set()
 
     found = set()
-    for fname in ("app.py", "ledger.py", "ui.py", "quotes.py", "storage.py", "finance.py"):
+    for fname in ("app.py", "ledger.py", "ui.py", "quotes.py", "storage.py", "finance.py", "csv_export.py"):
         tree = ast.parse(Path(fname).read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "tr" and node.args:
@@ -2249,6 +2531,8 @@ def _translated_texts() -> set[str]:
         found |= {title for _, title, _, _ in cols}
     found |= set(app.TxnDialog.AMOUNT_LABELS.values()) | set(app.TxnDialog.HINTS.values()) | {"Amount"}
     found |= set(ui.TEXT_SIZES) | {app.APP_NAME, app.ALL, "Holdings", "Transactions"}
+    for titles in (TXN_HEADERS, HOLDING_HEADERS, YEARLY_HEADERS, MONTHLY_HEADERS, FINANCE_YEARLY_HEADERS, ENTRY_HEADERS):
+        found |= set(titles)  # column titles of the CSV files
     return found
 
 
