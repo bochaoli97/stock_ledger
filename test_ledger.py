@@ -12,7 +12,7 @@ import json
 import string
 import sqlite3
 import tempfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal as D
 from pathlib import Path
 from types import SimpleNamespace
@@ -74,12 +74,15 @@ from ledger import (
     value_series,
 )
 from quotes import (
+    Quote,
     QuoteError,
     Suggestion,
     fetch_quotes,
     is_crypto,
+    is_live,
     ledger_symbol,
     match_local,
+    new_york_time,
     parse_search,
     parse_spark,
     search_symbols,
@@ -112,6 +115,16 @@ def txns(*rows):
 
 def ts(day: str, hour: int = 12) -> int:
     return int(datetime.fromisoformat(f"{day} {hour:02d}:00").timestamp())
+
+
+def utc(stamp: str) -> float:
+    """Unix time of a UTC clock reading such as '2026-10-27 14:00', so the market-hours tests need no time zone database."""
+    return datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc).timestamp()
+
+
+def quote_with_bars(*stamps: str) -> Quote:
+    """A quote whose chart has one bar at each of the UTC times given."""
+    return Quote(price=D(10), prev_close=D(9), time=None, points=[(int(utc(s)), 10.0) for s in stamps])
 
 
 def fake_urlopen(responses, calls=None):
@@ -1368,6 +1381,69 @@ def test_fetch_quotes_errors():
         assert fetch_quotes([]) == {}  # nothing to ask for: no request at all
 
 
+def test_new_york_time():
+    ny = lambda stamp: new_york_time(utc(stamp)).strftime("%Y-%m-%d %H:%M")  # noqa: E731
+    assert ny("2026-01-15 14:30") == "2026-01-15 09:30"  # winter: EST, 5 hours behind UTC
+    assert ny("2026-07-15 13:30") == "2026-07-15 09:30"  # summer: EDT, 4 hours behind
+    assert (ny("2026-03-08 06:59"), ny("2026-03-08 07:00")) == ("2026-03-08 01:59", "2026-03-08 03:00")  # spring forward
+    assert (ny("2026-11-01 05:59"), ny("2026-11-01 06:00")) == ("2026-11-01 01:59", "2026-11-01 01:00")  # fall back
+    try:
+        from zoneinfo import ZoneInfo
+
+        ref = ZoneInfo("America/New_York")
+    except Exception:  # no time zone database here (Windows without tzdata): the fixed cases above will do
+        return
+    for year in range(2008, 2041):  # every hour of the first two weeks of March and November, when the clocks change
+        for month in (3, 11):
+            t = datetime(year, month, 1, tzinfo=timezone.utc)
+            for _ in range(14 * 24):
+                assert new_york_time(t.timestamp()) == t.astimezone(ref).replace(tzinfo=None), t
+                t += timedelta(hours=1)
+
+
+def test_market_hours():
+    def live(symbol, now, *bars):
+        return is_live(symbol, quote_with_bars(*bars), utc(now))
+
+    # an ordinary Tuesday in summer time (EDT, 4 hours behind UTC): the session runs 13:30-20:00 UTC
+    assert not live("AAPL", "2026-10-27 13:29:59", "2026-10-26 19:55")  # before the open
+    assert live("AAPL", "2026-10-27 13:30:00", "2026-10-27 13:30")  # the open itself
+    assert live("AAPL", "2026-10-27 14:00:00", "2026-10-27 13:55")
+    assert live("AAPL", "2026-10-27 19:59:59", "2026-10-27 19:55")  # the last second
+    assert not live("AAPL", "2026-10-27 20:00:00", "2026-10-27 19:55")  # closed at 16:00
+    assert not live("AAPL", "2026-10-27 22:00:00", "2026-10-27 19:55")  # after hours do not count
+    assert not live("AAPL", "2026-10-27 13:31:00", "2026-10-26 19:55")  # open, but no trade yet today
+    assert live("AAPL", "2026-10-27 13:31:00", "2026-10-27 13:30")
+    # weekends
+    assert not live("AAPL", "2026-10-31 15:00", "2026-10-30 19:55")  # Saturday
+    assert not live("AAPL", "2026-11-01 15:00", "2026-10-30 19:55")  # Sunday
+    # a market holiday (Thanksgiving, Thursday 26 Nov 2026): the hours say open but the latest bar is Wednesday's
+    assert not live("AAPL", "2026-11-26 16:00", "2026-11-25 20:55")
+    # early closes at 13:00: the day after Thanksgiving, Christmas Eve and July 3; an ordinary Friday is open then
+    assert live("AAPL", "2026-11-27 17:59", "2026-11-27 17:55") and not live("AAPL", "2026-11-27 18:00", "2026-11-27 17:55")
+    assert live("AAPL", "2026-12-24 17:59", "2026-12-24 17:55") and not live("AAPL", "2026-12-24 18:00", "2026-12-24 17:55")
+    assert live("AAPL", "2028-07-03 16:59", "2028-07-03 16:55") and not live("AAPL", "2028-07-03 17:00", "2028-07-03 16:55")
+    assert live("AAPL", "2026-11-20 18:00", "2026-11-20 17:55")
+    # the clocks change: EST from Sunday 1 Nov 2026, EDT from Sunday 8 Mar 2026
+    assert not live("AAPL", "2026-11-02 13:31", "2026-11-02 13:30")  # Monday 8:31 EST
+    assert live("AAPL", "2026-11-02 14:31", "2026-11-02 14:30")  # 9:31 EST
+    assert live("AAPL", "2026-11-02 20:59", "2026-11-02 20:55") and not live("AAPL", "2026-11-02 21:00", "2026-11-02 20:55")
+    assert not live("AAPL", "2026-03-06 13:31", "2026-03-06 13:30") and live("AAPL", "2026-03-06 14:31", "2026-03-06 14:30")
+    assert not live("AAPL", "2026-03-09 12:31", "2026-03-09 12:30") and live("AAPL", "2026-03-09 13:31", "2026-03-09 13:30")
+    # crypto never closes (even without bars); plain BTC is an ETF on the stock market
+    assert live("BTC-USD", "2026-10-31 03:00", "2026-10-31 02:55") and live("eth-usd", "2026-11-01 15:00")
+    assert is_live("BTC-USD", Quote(price=D(1), prev_close=None, time=None), utc("2026-11-01 15:00"))
+    assert not live("BTC", "2026-10-31 03:00", "2026-10-30 19:55")
+    # without bars, the time of the last trade is used; without either, nothing is known
+    traded = lambda stamp: Quote(price=D(10), prev_close=D(9), time=datetime.fromtimestamp(utc(stamp)))  # noqa: E731
+    assert is_live("AAPL", traded("2026-10-27 13:58"), utc("2026-10-27 14:00"))
+    assert not is_live("AAPL", traded("2026-10-26 19:59"), utc("2026-10-27 14:00"))
+    assert not is_live("AAPL", Quote(price=D(10), prev_close=D(9), time=None), utc("2026-10-27 14:00"))
+    with mock.patch("quotes.time.time", return_value=utc("2026-10-27 14:00")):  # no time given: the clock decides
+        assert is_live("AAPL", quote_with_bars("2026-10-27 13:55"))
+        assert not is_live("AAPL", quote_with_bars("2026-10-26 19:55"))
+
+
 # ----------------------------------------------------------------------
 # Symbol search (type-ahead)
 # ----------------------------------------------------------------------
@@ -1626,6 +1702,127 @@ def test_pages_scroll_up_and_down_when_the_window_is_short():
             assert not scrolls and page.canvas.yview()[0] == 0  # back to the top once everything fits
     finally:
         _close_gui(root)
+
+
+def test_dots_pulse_only_while_a_market_is_open():
+    import time
+
+    win = _gui_window()
+    if win is None:
+        return
+    root, a = win
+    try:
+        # the account also holds some bitcoin; AAPL gets no quote, so it has no line and no dot
+        a.db.add_txn(Txn(account_id=a.account_id, date="2026-01-07", type="BUY", symbol="BTC-USD", quantity=D("0.01"),
+                         price=D(100000)))
+        a.refresh()
+        now = int(time.time())
+        for sym in ("SKYD", "BTC-USD"):
+            a.quotes[sym] = Quote(price=D(11), prev_close=D(10), time=None, points=[(now - 600, 10.5), (now - 300, 11.0)])
+        a.v_live.set(True)  # only the switch: nothing is fetched
+
+        def pulsing(*open_symbols):
+            """(does the total assets chart pulse, the stocks whose small chart pulses) with only these markets open"""
+            with mock.patch("app.is_live", lambda sym, quote: sym in open_symbols):
+                a.refresh_view()
+            root.update()
+            return bool(a.hero.chart.pulse), sorted(s for s, row in a.stock_rows.items() if row.spark.pulse)
+
+        assert pulsing("SKYD") == (True, ["SKYD"])  # a stock market is open: its small chart pulses, and so does the total
+        assert pulsing("BTC-USD") == (True, ["BTC-USD"])  # any holding that trades is enough for the total
+        assert pulsing("SKYD", "BTC-USD") == (True, ["BTC-USD", "SKYD"])
+        assert pulsing("AAPL") == (False, [])  # no quote, nothing to pulse
+        assert pulsing() == (False, [])  # everything closed
+        assert not a.hero.chart.find_withtag("dot") and not a.hero.chart.find_withtag("halo")  # not even a still dot
+        assert not any(row.spark.find_withtag("dot") for row in a.stock_rows.values())
+        a.open_symbol("SKYD")  # the stock's own page
+        root.update()
+        for market_open in (True, False):
+            with mock.patch("app.is_live", lambda sym, quote: market_open):
+                a.detail.reload()
+            assert bool(a.detail.hero.chart.pulse) == market_open
+        a.detail.hero.show("1W", "-", [(now - 600, 10.5, 0.0), (now, 11.0, 0.0)], live=True)
+        assert not a.detail.hero.chart.pulse  # only today's line has the dot
+    finally:
+        _close_gui(root)
+
+
+def test_pulse_dot_sizes():
+    from ui import UI
+
+    win = _gui_window()
+    if win is None:
+        return
+    root, a = win
+    try:
+        big = a.hero.chart
+        small = next(iter(a.stock_rows.values())).spark
+        assert 0 < small.dot_radius < big.dot_radius and 0 < small.halo_radius < big.halo_radius
+        assert big.dot_radius < UI.px(4.5) and big.halo_radius < UI.px(13)  # the main dot shrank (it was 4.5 and 13)
+        assert small.fps < big.fps  # a few pixels of halo need fewer frames
+        for chart in (big, small):
+            chart.set_data([1, 2, 3, 2.5], color="#00C805", pulse=True)
+            root.update()
+            x0, _, x1, _ = chart.coords("dot")
+            assert round((x1 - x0) / 2) == chart.dot_radius
+            for monotonic, radius in ((0.0, chart.dot_radius),  # the halo starts as big as the dot...
+                                      (chart.PULSE_PERIOD * 0.75, chart.dot_radius + chart.halo_radius)):  # ...and ends here
+                chart._stop_pulse()
+                with mock.patch("ui.time.monotonic", return_value=monotonic):
+                    chart._pulse_tick()
+                x0, _, x1, _ = chart.coords("halo")
+                assert abs((x1 - x0) / 2 - radius) < 0.01
+            chart._stop_pulse()
+    finally:
+        _close_gui(root)
+
+
+def test_window_maximizes_where_it_can():
+    import tkinter as tk
+    from ui import UI
+
+    class Window:
+        def __init__(self, **can):
+            self.can, self.calls = can, []
+
+        def state(self, name):
+            self.calls.append(("state", name))
+            if not self.can.get("state"):
+                raise tk.TclError(f'bad argument "{name}": must be normal, iconic, or withdrawn')
+
+        def attributes(self, *args):
+            self.calls.append(("attributes", *args))
+            if not self.can.get("attributes"):
+                raise tk.TclError("bad attribute")
+
+    win = Window(state=True)  # Windows and macOS
+    UI.maximize(win)
+    assert win.calls == [("state", "zoomed")]
+    win = Window(attributes=True)  # X11
+    UI.maximize(win)
+    assert win.calls == [("state", "zoomed"), ("attributes", "-zoomed", True)]
+    UI.maximize(Window())  # a window manager that can do neither keeps the normal size; nothing breaks
+    real = _gui_window()
+    if real is not None:
+        try:
+            UI.maximize(real[0])
+        finally:
+            _close_gui(real[0])
+
+
+def test_main_opens_the_window_maximized():
+    import app
+
+    root = mock.MagicMock()
+    calls = mock.Mock()  # records the order of the calls that matter
+    with mock.patch.multiple(app, data_dir=mock.Mock(return_value=Path("unused")), daily_backup=mock.Mock(),
+                             Storage=mock.Mock(), set_language=mock.Mock(), set_theme=mock.Mock(), App=calls.App), \
+            mock.patch.object(app.tk, "Tk", return_value=root), mock.patch.object(app.UI, "setup"), \
+            mock.patch.object(app.UI, "maximize", calls.maximize):
+        root.mainloop = calls.mainloop
+        app.main()
+    assert [c[0] for c in calls.mock_calls] == ["App", "maximize", "mainloop"]  # App sets the normal size first
+    assert calls.maximize.call_args.args == (root,)
 
 
 def test_all_accounts_view():

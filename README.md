@@ -21,7 +21,8 @@ symbol box, to suggest matching stocks (both can be turned off).
 - Automatic calculation of cash balance (with the running balance after every transaction), shares held, average cost, cost basis, realized P/L and total dividends
 - Per-stock detail: double-click a stock to see each of its transactions, with the shares held and average cost after each one
 - Live prices from Yahoo Finance every 10 seconds: market value, unrealized P/L, day change and total assets update as the market moves;
-  while the market is open, a pulsing dot marks the latest price at the end of today's line, as in Robinhood
+  while a market is open, a pulsing dot marks the latest price at the end of today's line (on the total assets chart, on a
+  stock's chart and, smaller, on each stock in the Stocks list), as in Robinhood
 - Turn live prices off to work fully offline and enter prices by hand instead
 - Symbol search as you type, like Robinhood: enter a ticker or a company name ("apple", "berkshire") and pick from
   the list with the mouse or Up/Down + Enter. Stocks you hold are listed first with their share count; other matches
@@ -133,6 +134,7 @@ would unpack itself to `%TEMP%` on every launch, and antivirus flags it far less
 
 Copy the whole `StockLedger` folder somewhere permanent, e.g. `D:\StockLedger\`, and double-click `StockLedger.exe`
 (right-click → *Send to → Desktop (create shortcut)* for a desktop icon).
+The window opens maximized; the restore button brings back the normal size.
 Data is saved in a `data` folder next to the exe. To update, delete `StockLedger.exe` and `_internal`, copy in the
 new ones, and leave the `data` folder alone. (Rebuilding never touches a `data` folder inside `dist\StockLedger`.)
 
@@ -153,6 +155,10 @@ new ones, and leave the `data` folder alone. (Rebuilding never touches a `data` 
 - The **Day Change** column and the "Today" line on the **Total Assets** card show today's move versus the previous close.
 - Data comes from Yahoo Finance. US stocks are near real time; some other exchanges are delayed up to 15 minutes.
   Outside trading hours the last close is shown.
+- The pulsing dot shows only while a market is open. US stocks and ETFs are open from 9:30 to 16:00 New York time on trading
+  days (until 13:00 on the few early-close days), wherever your computer is; weekends, holidays, and the hours before the open
+  and after the close do not count. Crypto never closes, so its dot always pulses. The dot on the total assets chart pulses
+  while any of your holdings is trading.
 - Symbols Yahoo doesn't know (e.g. CDs, private funds) are listed as "no quote"; enter their price with **Update prices**.
 - Write share classes either way: `BRK.B` and `BRK-B` both work.
 - Crypto is written as coin-USD: `BTC-USD`, `ETH-USD`, `SOL-USD` (searching "bitcoin" or "btc" finds it).

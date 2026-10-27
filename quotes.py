@@ -7,15 +7,18 @@ Symbols Yahoo does not know are simply left out of the result.
 Historical closes are split-adjusted by Yahoo (not dividend-adjusted).
 Symbol search (for the type-ahead suggestions) uses Yahoo's search endpoint and only
 sees what you type into the symbol box.
+is_live() says whether a symbol is trading right now (crypto around the clock, US stocks during
+their regular session); the charts pulse a dot only while it is.
 """
 
 from __future__ import annotations
 
 import json
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
@@ -119,6 +122,67 @@ def fetch_quotes(symbols, rng: str = "1d", interval: str = "5m") -> dict[str, Qu
             if ysym in by_yahoo:
                 result[by_yahoo[ysym]] = quote
     return result
+
+
+# ----------------------------------------------------------------------
+# Market hours: is a symbol trading right now?
+# ----------------------------------------------------------------------
+SESSION_OPEN = timedelta(hours=9, minutes=30)  # US stock markets (NYSE, Nasdaq, ...): 9:30 to 16:00, New York time
+SESSION_CLOSE = timedelta(hours=16)
+EARLY_CLOSE = timedelta(hours=13)  # the day after Thanksgiving, July 3 and Christmas Eve end at 13:00
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """The n-th given weekday (Monday = 0) of a month."""
+    first = date(year, month, 1)
+    return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+
+
+def new_york_time(ts: float) -> datetime:
+    """The wall-clock time in New York (a naive datetime) at unix time ts.
+
+    Worked out from the US daylight saving rules (from the second Sunday of March to the first Sunday of
+    November, switching at 2:00) because zoneinfo needs a time zone database, and Windows does not have one.
+    """
+    utc = datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None)
+    spring = _nth_weekday(utc.year, 3, 6, 2)
+    autumn = _nth_weekday(utc.year, 11, 6, 1)
+    dst_start = datetime(spring.year, spring.month, spring.day, 7)  # 2:00 EST is 7:00 UTC
+    dst_end = datetime(autumn.year, autumn.month, autumn.day, 6)  # 2:00 EDT is 6:00 UTC
+    return utc + timedelta(hours=-4 if dst_start <= utc < dst_end else -5)
+
+
+def _session_close(day: date) -> timedelta:
+    """When the regular session ends on `day`. (Where July 3 or Christmas Eve is itself a holiday there is no
+    trading at all, which is_live finds out from the latest bar.)"""
+    after_thanksgiving = _nth_weekday(day.year, 11, 3, 4) + timedelta(days=1)
+    early = day == after_thanksgiving or (day.month, day.day) in ((7, 3), (12, 24))
+    return EARLY_CLOSE if early else SESSION_CLOSE
+
+
+def is_live(symbol: str, quote: Quote, now: float | None = None) -> bool:
+    """Is the symbol trading right now?
+
+    Crypto never closes. A US stock counts as open on weekdays from 9:30 to 16:00 New York time (13:00 on the
+    few early-close days) if its latest bar is from today's session. That second test is what recognizes a
+    market holiday, or the minutes before the day's first trade, without a holiday calendar: the latest bar is
+    then still an earlier day's. Pre-market and after-hours trading do not count; the charts show only the
+    regular session as well.
+    """
+    if is_crypto(symbol):
+        return True
+    now = time.time() if now is None else now
+    local = new_york_time(now)
+    into_day = local - datetime(local.year, local.month, local.day)
+    if local.weekday() >= 5 or not SESSION_OPEN <= into_day < _session_close(local.date()):
+        return False
+    if quote.points:
+        last = quote.points[-1][0]
+    elif quote.time:
+        last = quote.time.timestamp()
+    else:
+        return False
+    return now - last <= (into_day - SESSION_OPEN).total_seconds()  # no older than today's open
 
 
 # ----------------------------------------------------------------------

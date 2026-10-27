@@ -73,7 +73,7 @@ from ledger import (
     valuation,
     value_series,
 )
-from quotes import Quote, Suggestion, fetch_quotes, is_crypto, match_local, search_symbols
+from quotes import Quote, Suggestion, fetch_quotes, is_crypto, is_live, match_local, search_symbols
 from storage import Storage, daily_backup
 from ui import (
     C,
@@ -104,7 +104,6 @@ APP_VERSION = "2.0"
 LIVE_INTERVAL = 10  # seconds between live price updates
 HISTORY_TTL = 600  # seconds to reuse fetched price history before fetching again
 DAY_SLOTS = 79  # 5-minute bars in a US trading day (+ the close), so today's line fills the chart as the day goes on
-PULSE_FRESH = 20 * 60  # seconds: the 1D chart's dot pulses while its latest price is at most this old (market open)
 
 ALL = "All"  # the "no filter" choice (shown translated)
 CUSTOM_PERIOD = "Custom range…"  # the period choice that takes two typed dates (shown translated)
@@ -751,9 +750,11 @@ class Hero(tk.Frame):
         self.baseline: float | None = None
         self.now: tuple[str, str, str, str] = ("-", "", "", "")  # value, change, color, period
 
-    def show(self, rng, now_value: str, points, *, baseline=None, now_change=None, now_base=None, message=""):
+    def show(self, rng, now_value: str, points, *, baseline=None, now_change=None, now_base=None, message="",
+             live=False):
         """points: [(unix time, value, net deposits)]; change is measured against `baseline` if given
-        (1D: previous close), otherwise against the first point with deposits/withdrawals taken out."""
+        (1D: previous close), otherwise against the first point with deposits/withdrawals taken out.
+        live: the market is open (quotes.is_live), so today's line ends in a pulsing dot."""
         self.rng = rng
         self.points = points
         self.baseline = baseline
@@ -762,11 +763,10 @@ class Hero(tk.Frame):
         color = color_for(now_change) if now_change else C["gain"]
         self.now = (now_value, change_text(now_change, now_base) if now_change is not None else "",
                     color, tr(RANGES[rng][2]) if now_change is not None else "")
-        # like Robinhood, the end of today's line pulses while prices are coming in
-        live = rng == "1D" and bool(points) and time.time() - points[-1][0] < PULSE_FRESH
+        # like Robinhood, the end of today's line pulses while the market is open
         self.chart.set_data([p[1] for p in points], color=color, baseline=baseline,
                             labels=[time_label(p[0], rng) for p in points],
-                            slots=self.slots_1d if rng == "1D" else 0, message=message, pulse=live)
+                            slots=self.slots_1d if rng == "1D" else 0, message=message, pulse=live and rng == "1D")
         self.tabs.set_accent(color)
         self._hover(None)
 
@@ -862,7 +862,8 @@ class SymbolDetail(PageScroll):
                 self.hero.show(self.rng, now_value, [], message=tr("Loading…" if app._fetching else "No chart data"))
                 return
             points = [(t, c, 0.0) for t, c in q.points] + [(int(time.time()), float(q.price), 0.0)]
-            self.hero.show("1D", now_value, points, baseline=float(q.prev_close) if q.prev_close else None)
+            self.hero.show("1D", now_value, points, baseline=float(q.prev_close) if q.prev_close else None,
+                           live=is_live(sym, q))
             return
         fetched, hq = self.history.get(self.rng, (0, None))
         if time.time() - fetched > HISTORY_TTL:
@@ -1561,7 +1562,8 @@ class StockRow(tk.Frame):
         self.sym_label.grid(row=0, column=0, sticky="sw")
         self.sub = label(self, "", font=UI.small, color=C["muted"])
         self.sub.grid(row=1, column=0, sticky="nw")
-        self.spark = LineChart(self, height=UI.px(34), width=UI.px(70), interactive=False, pad=2, line_width=1.5)
+        self.spark = LineChart(self, height=UI.px(34), width=UI.px(70), interactive=False, pad=2, line_width=1.5,
+                               dot=2.5, halo=4, fps=15)  # a small chart gets a small dot, and needs fewer frames
         self.spark.grid(row=0, column=1, rowspan=2, padx=UI.px(10))
         self.pill = tk.Canvas(self, width=UI.px(84), height=UI.px(30), bg=C["bg"], highlightthickness=0, bd=0)
         self.pill.grid(row=0, column=2, rowspan=2)
@@ -1582,7 +1584,8 @@ class StockRow(tk.Frame):
         color = color_for(change) if change else C["muted"]
         if quote and len(quote.points) >= 2:
             self.spark.set_data([c for _, c in quote.points] + [float(quote.price)], color=color,
-                                baseline=float(quote.prev_close) if quote.prev_close else None, slots=DAY_SLOTS)
+                                baseline=float(quote.prev_close) if quote.prev_close else None, slots=DAY_SLOTS,
+                                pulse=is_live(pos.symbol, quote))
         else:
             self.spark.set_data([])
         c = self.pill
@@ -2384,6 +2387,11 @@ class App:
                 base += p.quantity * q.prev_close
         return change, base
 
+    def _market_live(self) -> bool:
+        """Is any holding trading right now? Then the total assets are moving and the chart's dot pulses."""
+        held = ((p.symbol, self.quotes.get(p.symbol)) for p in self.result.open_positions)
+        return any(q is not None and is_live(sym, q) for sym, q in held)
+
     # ------------------------------------------------------------ Chart
     def _on_range(self, rng):
         self.range = rng
@@ -2410,7 +2418,8 @@ class App:
             day, _ = self._day_change()
             points = [(p.time, p.value, p.net_deposits) for p in self._value_points(series)] + [end]
             prev = float(total - day)
-            hero.show("1D", now, points, baseline=prev, now_change=float(day), now_base=prev)
+            hero.show("1D", now, points, baseline=prev, now_change=float(day), now_base=prev,
+                      live=self._market_live())
             return
         if self.range == "ALL":
             yr, iv = all_range(r.rows[0].txn.date)
@@ -2808,6 +2817,7 @@ def main():
             pass
     UI.setup(root, TEXT_SIZES[text_size(db)], cjk=language() == "zh")
     App(root, db, folder)
+    UI.maximize(root)  # after App has set the normal size, which the restore button goes back to
     root.mainloop()
 
 
