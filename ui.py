@@ -203,6 +203,19 @@ class UI:
         h = min(cls.px(h), int(win.winfo_screenheight() * 0.85))
         return f"{w}x{h}"
 
+    @classmethod
+    def maximize(cls, win) -> None:
+        """Open the window maximized (not full screen); the size given to geometry() is what the restore button
+        goes back to. Windows and macOS call this the 'zoomed' state; on X11 it is a window attribute. A window
+        manager that can do neither just keeps the normal size."""
+        try:
+            win.state("zoomed")
+        except tk.TclError:
+            try:
+                win.attributes("-zoomed", True)
+            except tk.TclError:
+                pass
+
 
 def style_menu(menu: tk.Menu) -> tk.Menu:
     # Windows draws popup menus natively and ignores most of these; Linux/macOS use them
@@ -358,18 +371,22 @@ class LineChart(tk.Canvas):
     on_hover(index or None) is called as the mouse moves, so the caller can show that point's value.
     `slots` reserves room for more points than there are (e.g. a full trading day while the market is open).
     pulse=True marks the latest point with a dot and a halo that keeps swelling and fading (a live price).
+    `dot` is that dot's radius and `halo` how far the halo swells beyond it (sizes before scaling, so a small chart
+    gets small ones); `fps` is how many times a second the halo is redrawn.
     """
 
     PULSE_PERIOD = 1.8  # seconds per pulse: the halo grows and fades over most of it, then rests
-    PULSE_FPS = 30
 
     def __init__(self, parent, height: int, *, on_hover=None, interactive=True, pad=10, line_width=2.0, bg=None,
-                 width=None):
+                 width=None, dot=3.5, halo=10, fps=30):
         kw = {"width": width} if width else {}
         super().__init__(parent, height=height, bg=bg or C["bg"], highlightthickness=0, bd=0, **kw)
         self.on_hover = on_hover
         self.pad = UI.px(pad)
         self.line_width = UI.px(line_width) or 1
+        self.dot_radius = UI.px(dot)
+        self.halo_radius = UI.px(halo)
+        self.fps = fps
         self.values: list[float] = []
         self.labels: list[str] = []
         self.baseline: float | None = None
@@ -433,7 +450,7 @@ class LineChart(tk.Canvas):
         self.create_line(*coords, fill=self.color, width=self.line_width, capstyle="round", joinstyle="round")
         if self._pulse_at:
             cx, cy = self._pulse_at
-            r = UI.px(4.5)
+            r = self.dot_radius
             self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=self.color, outline="", tags="dot")
             if self._hovering:
                 self.itemconfigure("dot", state="hidden")
@@ -456,14 +473,15 @@ class LineChart(tk.Canvas):
             phase = (time.monotonic() % self.PULSE_PERIOD) / self.PULSE_PERIOD
             grow = min(phase / 0.75, 1.0)  # swell over the first 3/4, then rest unseen
             ease = 1 - (1 - grow) ** 3  # fast at first, slowing as it widens
-            r = UI.px(4.5) + ease * UI.px(13)
+            r = self.dot_radius + ease * self.halo_radius
             cx, cy = self._pulse_at
             self.coords("halo", cx - r, cy - r, cx + r, cy + r)
-            # starts as a soft tint of the line color and fades into the background
-            self.itemconfigure("halo", fill=self._mix(self.color, C["bg"], 0.5 + 0.5 * grow),
+            # starts as a soft tint of the line color and fades into the background (the canvas's own: a row in
+            # the Stocks list changes it while the mouse is over the row)
+            self.itemconfigure("halo", fill=self._mix(self.color, self.cget("background"), 0.5 + 0.5 * grow),
                                state="hidden" if grow >= 1 else "normal")
         # when the window is minimized or covered by another page, check back slowly instead of animating
-        self._pulse_job = self.after(1000 // self.PULSE_FPS if visible else 500, self._pulse_tick)
+        self._pulse_job = self.after(1000 // self.fps if visible else 500, self._pulse_tick)
 
     def _stop_pulse(self):
         if self._pulse_job is not None:
