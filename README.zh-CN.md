@@ -3,7 +3,7 @@
 [English](README.md) | **简体中文**
 
 一个简单的本地券商账户记账软件：记录现金余额、持仓，以及每笔交易的成本和盈亏。
-只用 Python 标准库（tkinter 界面 + sqlite3 数据库），数据保存在你自己的电脑上。
+使用 PyQt6 桌面界面和 sqlite3 数据库，数据保存在你自己的电脑上。
 会发送到网上的只有两样东西：你的股票代码（用于获取实时价格），以及你在代码框里输入的内容（用于提示匹配的股票）。两者都可以关闭。
 
 ## 功能
@@ -11,6 +11,7 @@
 - Robinhood 风格的界面：深色模式（也可切换浅色），大字显示总资产，下方是资产走势图
   （1天 / 1周 / 1个月 / 3个月 / 今年 / 1年 / 全部），鼠标移到图上可查看任意时刻的数值；右侧“股票”列表
   显示每只持仓今天的迷你走势图和价格
+- 仅账户大字资产（全部账户或单一账户）和个股详情现价使用动画：语义槽位在跨千分位时平滑扩缩，实时行情、曲线滑动和鼠标移出回位均使用相同的分级滚动：小数位 260/320ms，仅最高发生变化的整数位在单步变化时使用 650ms，其余整数滚动 450ms。滑动时保持中性色，行情与回位才闪红绿并在 600ms 内淡出。纵向绘制方向已镜像反转，保留最短环形路径。浅色主题沿用可读的深色文字。
 - 多账户（例如 Fidelity 个人账户和 Roth IRA）；新建账户时可以填写期初现金和期初持仓
 - **全部账户**视图：有两个或更多账户时，可以把它们加在一起看总净资产，并有各账户明细表和跨账户合并的持仓
 - 交易类型：存入、取出、买入、卖出、股息、利息、费用、股份转入、股份转出、拆股、代码变更、派发
@@ -44,6 +45,13 @@
 | `storage.py` | 数据存储（SQLite） |
 | `quotes.py` | 实时行情和历史价格（Yahoo Finance，不需要 API key） |
 | `ui.py` | 外观：深色/浅色主题、字体、图表等自绘控件 |
+| `qt_widgets.py` | 原生 PyQt6 控件、布局、事件与对话框 |
+| `ticker.py` | 账户与个股大字数字的 PyQt6 独立数字列动画 |
+| `requirements.txt` | 运行依赖（PyQt6） |
+| `requirements-dev.txt` | 测试与静态检查工具 |
+| `test_qt_ui.py` | Qt 交互与数字动画回归测试 |
+| `test_ticker.py` | 迁移后的八个数字动画回归场景 |
+| `QA_REPORT.md` | 迁移复核结果及验证边界 |
 | `i18n.py` | 界面语言：中英文文字 |
 | `test_ledger.py` | 测试：记账逻辑、财务收支页、存储、行情、股票搜索和翻译（不需要联网） |
 | `icon.ico` | 程序图标 |
@@ -63,12 +71,13 @@ unzip stock_ledger.zip
 cd stock_ledger
 ```
 
-**2. 创建 conda 环境**（要用 `xft` 版本的 Tk，它在 Linux 上能使用真正的平滑字体）：
+**2. 创建 conda 环境并安装 PyQt6**：
 
 ```bash
-conda create -n stockledger -c conda-forge python=3.12 "tk=8.6.*=xft*" xorg-libxft -y
+conda create -n stockledger -c conda-forge python=3.12 -y
 conda activate stockledger
-python -c "import tkinter; tkinter._test()"   # 弹出一个小窗口，说明图形界面正常
+python -m pip install -r requirements.txt
+python -c "from qt_widgets import Window; w = Window(); w.mainloop()"  # 打开测试窗口
 ```
 
 **3. 安装中日韩字体**：使用中文界面，或者账户名称、备注里有中日韩文字时需要安装，否则在 WSL 里会显示成方框：
@@ -89,8 +98,20 @@ sudo apt update && sudo apt install -y fonts-noto-cjk
 ```bash
 conda activate stockledger
 python app.py          # 启动软件（窗口会通过 WSLg 显示在 Windows 桌面上）
-python test_ledger.py  # 运行测试，检查计算是否正确
+python test_ledger.py  # 账务与原有功能回归测试
+python -m unittest -v test_qt_ui  # Qt 交互与数字动画测试
 ```
+
+运行全部测试（包括迁移后的数字动画回归测试），先安装测试工具：
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+没有图形桌面时，在测试命令前加上 `QT_QPA_PLATFORM=offscreen`。
+原数字动画测试的八个场景已在 `test_ticker.py` 中迁移为 PyQt6 测试，
+`test_qt_ui.py` 另行覆盖原生交互与动画细节。
 
 也可以在 VS Code 中打开 `app.py`，按 `F5` 带断点运行。
 
@@ -104,7 +125,7 @@ python test_ledger.py  # 运行测试，检查计算是否正确
 **1. 在 Windows 上安装 Python**（只需一次）
 
 从 <https://www.python.org/downloads/windows/> 下载 Python 3.12 或更新版本并安装。
-安装时勾选 **Add python.exe to PATH**，其他保持默认即可（默认已包含 tkinter）。
+安装时勾选 **Add python.exe to PATH**，其他保持默认即可。打包脚本会自动安装 PyQt6。
 
 **2. 打包**，两种方法任选一种：
 
@@ -117,14 +138,14 @@ bash build_from_wsl.sh
 它会把源代码复制到 `C:\Users\<你>\StockLedgerBuild`，用 Windows 版 Python 安装 PyInstaller 并打包，
 完成后打开包含 `StockLedger.exe` 的 `dist\StockLedger` 文件夹。
 
-方法 B：把 `app.py ledger.py finance.py csv_export.py storage.py quotes.py ui.py i18n.py icon.ico build_exe.bat` 复制到 Windows 上的一个文件夹里，双击 `build_exe.bat`。
+方法 B：把 `app.py ledger.py finance.py csv_export.py storage.py quotes.py ui.py qt_widgets.py ticker.py requirements.txt i18n.py icon.ico build_exe.bat` 复制到 Windows 上的一个文件夹里，双击 `build_exe.bat`。
 
 第一次打包要下载 PyInstaller，大约 1～2 分钟；之后会快很多。
 
 **3. 使用 exe**
 
 打包结果是一个文件夹 `dist\StockLedger`：里面有 `StockLedger.exe` 和它需要的 `_internal` 文件夹
-（Python 和 Tk 都在里面，所以电脑上不需要安装 Python）。文件夹形式比单文件 exe 启动更快
+（Python 和 Qt 都在里面，所以电脑上不需要安装 Python）。文件夹形式比单文件 exe 启动更快
 （单文件 exe 每次启动都要先解压到 `%TEMP%`），也更少被杀毒软件误报。
 
 把整个 `StockLedger` 文件夹复制到固定位置，例如 `D:\StockLedger\`，双击 `StockLedger.exe` 即可运行
@@ -275,10 +296,10 @@ bash build_from_wsl.sh
 **在 WSL 里运行 `python app.py` 没有窗口**
 需要 WSLg（Windows 11 自带；Windows 10 需要较新的版本）。在 Windows PowerShell 中运行 `wsl --update`，然后 `wsl --shutdown` 重启 WSL 再试。
 
-**WSL 里字体很小、有锯齿，或者某些符号显示成 `\u25be`**
-你的 Tk 是 `noxft` 版本，在 Linux 上用不了真正的字体。换成 `xft` 版本：
-`conda install -n stockledger -c conda-forge "tk=8.6.*=xft*" xorg-libxft`。
-这只影响开发时的显示；exe 在 Windows 上使用 Segoe UI（中文界面使用微软雅黑）。
+**Qt 在 WSL 中无法连接图形显示**
+确认 WSLg 已启动，并在当前环境中运行 `python -m pip install -r requirements.txt`。
+无显示器的测试环境可使用 `QT_QPA_PLATFORM=offscreen python test_ledger.py` 和
+`QT_QPA_PLATFORM=offscreen python -m unittest -v test_qt_ui`。
 
 **Windows Defender / 杀毒软件报毒**
 PyInstaller 打包的未签名程序偶尔会被误报（文件夹形式比单文件少得多）。可以在 Defender 中把 `StockLedger` 文件夹加入排除项。

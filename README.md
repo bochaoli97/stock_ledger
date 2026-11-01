@@ -3,7 +3,7 @@
 **English** | [简体中文](README.zh-CN.md)
 
 A simple local bookkeeping app for a brokerage account: it tracks the cash balance, holdings, and the cost and profit/loss of every trade.
-It uses only the Python standard library (tkinter UI + sqlite3 database) and keeps your data on your own computer.
+It uses PyQt6 for the desktop interface and sqlite3 for storage, and keeps your data on your own computer.
 The only things it sends over the internet are your stock symbols, to fetch live prices, and what you type into a
 symbol box, to suggest matching stocks (both can be turned off).
 
@@ -13,6 +13,7 @@ symbol box, to suggest matching stocks (both can be turned off).
   (1D / 1W / 1M / 3M / YTD / 1Y / ALL), hover the chart to see any point in time, and a Stocks list with
   today's sparkline and price for every holding
 
+- Only the account headline (single or all accounts) and stock detail price animate. Semantic digit slots expand and collapse smoothly across thousands separators. Live ticks, chart scrubbing and restore use the same 260/320 ms decimal gears. Only the most-significant changed integer uses 650 ms when it changes by one; other integer rolls use 450 ms. Scrubbing stays neutral, while live/restore changes flash and fade over 600 ms. The vertical reel is mirrored while preserving shortest circular paths. Light mode retains its readable dark foreground.
 - Multiple accounts (e.g. a Fidelity individual account and a Roth IRA); opening cash and positions can be entered when creating one
 - **All accounts** view: with two or more accounts, add them up into one net worth, with a per-account table
   and holdings merged across accounts
@@ -48,6 +49,13 @@ symbol box, to suggest matching stocks (both can be turned off).
 | `storage.py` | Persistence (SQLite) |
 | `quotes.py` | Live stock quotes and price history (Yahoo Finance, no API key needed) |
 | `ui.py` | Look and feel: dark/light themes, fonts, chart and other custom widgets |
+| `qt_widgets.py` | Native PyQt6 controls, layouts, events and dialogs |
+| `ticker.py` | Independent PyQt6 digit rollers for the account and stock headlines |
+| `requirements.txt` | Runtime dependency (PyQt6) |
+| `requirements-dev.txt` | Test and static-check tools |
+| `test_qt_ui.py` | Qt interaction and ticker regressions |
+| `test_ticker.py` | Eight migrated ticker regression scenarios |
+| `QA_REPORT.md` | Migration audit results and verification limits |
 | `i18n.py` | Interface language: English / Chinese text |
 | `test_ledger.py` | Tests for the bookkeeping logic, the finance page, storage, quotes, symbol search and translations (no internet needed) |
 | `icon.ico` | App icon |
@@ -67,12 +75,13 @@ unzip stock_ledger.zip
 cd stock_ledger
 ```
 
-**2. Create a conda environment** (with the `xft` build of Tk, which can use real, smooth fonts on Linux):
+**2. Create a conda environment and install PyQt6**:
 
 ```bash
-conda create -n stockledger -c conda-forge python=3.12 "tk=8.6.*=xft*" xorg-libxft -y
+conda create -n stockledger -c conda-forge python=3.12 -y
 conda activate stockledger
-python -c "import tkinter; tkinter._test()"   # a small window popping up means the GUI works
+python -m pip install -r requirements.txt
+python -c "from qt_widgets import Window; w = Window(); w.mainloop()"  # a small test window
 ```
 
 **3. Install CJK fonts** — needed for the Chinese interface, and for account names or notes in Chinese/Japanese/Korean,
@@ -94,8 +103,20 @@ sudo apt update && sudo apt install -y fonts-noto-cjk
 ```bash
 conda activate stockledger
 python app.py          # start the app (the window appears on the Windows desktop via WSLg)
-python test_ledger.py  # run the tests to check the calculations
+python test_ledger.py  # bookkeeping and existing feature regressions
+python -m unittest -v test_qt_ui  # Qt interactions and ticker animations
 ```
+
+To run every test, including the migrated ticker regressions, install the test tools once:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+Without a desktop, prefix the test command with `QT_QPA_PLATFORM=offscreen`.
+The eight original ticker regression scenarios now run against PyQt6 in
+`test_ticker.py`; `test_qt_ui.py` covers native interactions and animation details.
 
 You can also open `app.py` in VS Code and press `F5` to run it with breakpoints.
 
@@ -109,7 +130,7 @@ During development, data is stored in `stock_ledger/data/stock_ledger.db`.
 **1. Install Python on Windows** (one time)
 
 Download Python 3.12 or newer from <https://www.python.org/downloads/windows/> and install it.
-Tick **Add python.exe to PATH** in the installer and keep the other defaults (tkinter is included by default).
+Tick **Add python.exe to PATH** in the installer and keep the other defaults. The build script installs PyQt6.
 
 **2. Build**, using either method:
 
@@ -122,13 +143,13 @@ bash build_from_wsl.sh
 It copies the source to `C:\Users\<you>\StockLedgerBuild`, uses the Windows Python to install PyInstaller and build,
 then opens the `dist\StockLedger` folder containing `StockLedger.exe`.
 
-Option B: copy `app.py ledger.py finance.py csv_export.py storage.py quotes.py ui.py i18n.py icon.ico build_exe.bat` to a folder on Windows and double-click `build_exe.bat`.
+Option B: copy `app.py ledger.py finance.py csv_export.py storage.py quotes.py ui.py qt_widgets.py ticker.py requirements.txt i18n.py icon.ico build_exe.bat` to a folder on Windows and double-click `build_exe.bat`.
 
 The first build downloads PyInstaller and takes about 1–2 minutes; later builds are much faster.
 
 **3. Use the exe**
 
-The build is a folder, `dist\StockLedger`: `StockLedger.exe` plus an `_internal` folder it needs (Python and Tk
+The build is a folder, `dist\StockLedger`: `StockLedger.exe` plus an `_internal` folder it needs (Python and Qt
 are inside, so the PC does not need Python installed). A folder build starts faster than a single-file exe, which
 would unpack itself to `%TEMP%` on every launch, and antivirus flags it far less often.
 
@@ -298,10 +319,10 @@ use the **Year** column to pick a tax year.
 **No window appears when running `python app.py` in WSL**
 You need WSLg (built into Windows 11; Windows 10 needs a recent build). Run `wsl --update` in Windows PowerShell, then `wsl --shutdown` to restart WSL and try again.
 
-**Fonts look tiny / pixelated in WSL, or some symbols show as `\u25be`**
-Your Tk is the `noxft` build, which can't use real fonts on Linux. Switch to the `xft` build:
-`conda install -n stockledger -c conda-forge "tk=8.6.*=xft*" xorg-libxft`.
-This only affects display during development; the exe uses Segoe UI on Windows (Microsoft YaHei in Chinese).
+**Qt cannot connect to a display in WSL**
+Check that WSLg is running and install PyQt6 in the active environment with `python -m pip install -r requirements.txt`.
+For tests on a machine without a display, use `QT_QPA_PLATFORM=offscreen python test_ledger.py` and
+`QT_QPA_PLATFORM=offscreen python -m unittest -v test_qt_ui`.
 
 **Windows Defender / antivirus flags the exe**
 Unsigned programs built by PyInstaller are occasionally false positives (much less often for folder builds like
