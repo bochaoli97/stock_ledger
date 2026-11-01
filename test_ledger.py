@@ -1537,7 +1537,7 @@ def test_symbol_search_suggestions():
     shown.clear()
     online = [Suggestion("AMD", "Advanced Micro Devices", "NASDAQ"), Suggestion("A", "Agilent", "NYSE", "Equity"),
               Suggestion("ABNB", "Airbnb", "", "Equity")]
-    with mock.patch.object(app, "search_symbols", lambda q, limit: online) as fake:
+    with mock.patch.object(app, "search_symbols", lambda q, limit: online):
         search("a", show)
         assert len(shown) == 1 and len(scheduled) == 1  # local matches now, the online search after a pause
         scheduled.pop()()
@@ -1565,13 +1565,13 @@ def test_symbol_search_suggestions():
 # Main window (needs a display; skipped where there is none, e.g. over plain SSH)
 # ----------------------------------------------------------------------
 def _gui_window():
-    """(tk root, app.App) with one account holding SKYD and AAPL and live prices off, or None without a display."""
-    import tkinter as tk
+    """(Qt window, app.App) holding SKYD and AAPL with live prices off, or None without a display."""
+    import qt_widgets as qt
     import app
 
     try:
-        root = tk.Tk()
-    except tk.TclError:
+        root = qt.Window()
+    except qt.WidgetError:
         return None
     root.withdraw()
     folder = Path(tempfile.mkdtemp())
@@ -1590,13 +1590,13 @@ def _gui_window():
 
 def _close_gui(root):
     """Destroy a test window; its pending timers (background polling) must not fire later in another one."""
-    for job in root.tk.splitlist(root.tk.call("after", "info")):
+    import qt_widgets as qt
+    for job in list(qt._jobs):
         root.after_cancel(job)
     root.destroy()
 
 
 def test_tables_scroll_sideways_when_narrow():
-    import tkinter as tk
     import app
     from ui import make_tree
 
@@ -1606,9 +1606,10 @@ def test_tables_scroll_sideways_when_narrow():
     root, _ = win
     try:
         frame, tree = make_tree(root, app.columns(app.App.HOLD_COLUMNS))
-        frame.place(x=0, y=0, width=600, height=300)  # narrower than the columns need
-        bar = next(w for w in frame.winfo_children() if w.winfo_class() == "TScrollbar" and str(w.cget("orient")) == "horizontal")
-        root.update()
+        frame.setGeometry(0, 0, 600, 300)
+        frame.show()  # narrower than the columns need
+        bar = next(w for w in frame.winfo_children() if w.winfo_class() == "Scrollbar" and str(w.cget("orient")) == "horizontal")
+        root.process_events()
         assert tree.xview()[1] < 1 and bar.winfo_ismapped()  # columns keep their width; the rest is reached by scrolling
         assert all(tree.column(c, "width") >= app.UI.px(w) for c, (_, _, w, _) in zip(tree["columns"], app.App.HOLD_COLUMNS))
         total = sum(tree.column(c, "width") for c in tree["columns"])
@@ -1616,13 +1617,13 @@ def test_tables_scroll_sideways_when_narrow():
                                 (bar, "<MouseWheel>", dict(delta=-120)), (bar, "<Button-5>", {})):
             tree.xview_moveto(0)
             widget.event_generate(seq, x=5, y=3, **kw)  # one notch of the wheel moves a useful distance, not 1-5 pixels
-            root.update()
+            root.process_events()
             assert round(tree.xview()[0] * total) == app.UI.px(80), seq
         tree.event_generate("<Shift-MouseWheel>", x=5, y=3, delta=120)  # wheel up goes back left
-        root.update()
+        root.process_events()
         assert tree.xview()[0] == 0
-        frame.place_configure(width=1800)
-        root.update()
+        frame.resize(1800, 300)
+        root.process_events()
         assert tree.xview() == (0.0, 1.0) and not bar.winfo_ismapped()  # room to spare: stretched, no scroll bar
     finally:
         _close_gui(root)
@@ -1634,29 +1635,29 @@ def test_stock_page_opens_inside_the_window():
         return
     root, a = win
     try:
-        root.update()
+        root.process_events()
         assert a.detail is None and a.overview.winfo_ismapped()
         a.open_symbol("SKYD")
-        root.update()
+        root.process_events()
         assert a.detail.symbol == "SKYD" and a.detail.winfo_ismapped() and not a.overview.winfo_ismapped()
         assert a.detail.winfo_toplevel() is root  # not a window of its own
         assert root.title().startswith("SKYD") and len(a.detail.tree.get_children()) == 1
         a.open_symbol("SKYD")  # already open: nothing changes
         a.open_symbol("AAPL")  # picking another stock switches the page
-        root.update()
+        root.process_events()
         assert a.detail.symbol == "AAPL" and root.title().startswith("AAPL")
         a.open_symbol("NOPE")  # unknown symbol: ignored
         assert a.detail.symbol == "AAPL"
         a.rebuild()  # a theme / language / text size change keeps you on the same stock
-        root.update()
+        root.process_events()
         assert a.detail.symbol == "AAPL" and not a.overview.winfo_ismapped()
         root.event_generate("<Escape>")  # Esc goes back
-        root.update()
+        root.process_events()
         assert a.detail is None and a.overview.winfo_ismapped() and root.title() == i18n.tr("Stock Ledger")
         a.open_symbol("SKYD")
         a.db.delete_txn(next(t.id for t in a.txns if t.symbol == "SKYD"))
         a.refresh()  # the stock no longer exists: back to the overview instead of an empty page
-        root.update()
+        root.process_events()
         assert a.detail is None and a.overview.winfo_ismapped()
     finally:
         _close_gui(root)
@@ -1669,7 +1670,7 @@ def test_pages_scroll_up_and_down_when_the_window_is_short():
     root, a = win
     try:
         def check(page, tree):
-            root.update()
+            root.process_events()
             return page.sb.winfo_ismapped(), tree.winfo_ismapped(), tree.winfo_height()
 
         for open_stock in (False, True):
@@ -1685,16 +1686,16 @@ def test_pages_scroll_up_and_down_when_the_window_is_short():
             assert scrolls and shown and 100 <= short < tall  # still at least a few rows tall
             top = page.canvas.yview()[0]
             hero.value.event_generate("<MouseWheel>", delta=-120, x=5, y=5)  # the wheel scrolls the page...
-            root.update()
+            root.process_events()
             assert page.canvas.yview()[0] > top
             moved = page.canvas.yview()[0]
             hero.value.event_generate("<Shift-MouseWheel>", delta=-120, x=5, y=5)  # ...but Shift is for tables
-            root.update()
+            root.process_events()
             assert page.canvas.yview()[0] == moved
             side = next(w for w in tree.master.winfo_children()
-                        if w.winfo_class() == "TScrollbar" and str(w.cget("orient")) == "horizontal")
+                        if w.winfo_class() == "Scrollbar" and str(w.cget("orient")) == "horizontal")
             side.event_generate("<MouseWheel>", delta=-120, x=5, y=3)  # on the sideways bar the wheel goes sideways
-            root.update()
+            root.process_events()
             assert page.canvas.yview()[0] == moved and tree.xview()[0] > 0
             tree.xview_moveto(0)
             root.geometry("1440x1000")
@@ -1725,7 +1726,7 @@ def test_dots_pulse_only_while_a_market_is_open():
             """(does the total assets chart pulse, the stocks whose small chart pulses) with only these markets open"""
             with mock.patch("app.is_live", lambda sym, quote: sym in open_symbols):
                 a.refresh_view()
-            root.update()
+            root.process_events()
             return bool(a.hero.chart.pulse), sorted(s for s, row in a.stock_rows.items() if row.spark.pulse)
 
         assert pulsing("SKYD") == (True, ["SKYD"])  # a stock market is open: its small chart pulses, and so does the total
@@ -1736,9 +1737,9 @@ def test_dots_pulse_only_while_a_market_is_open():
         assert not a.hero.chart.find_withtag("dot") and not a.hero.chart.find_withtag("halo")  # not even a still dot
         assert not any(row.spark.find_withtag("dot") for row in a.stock_rows.values())
         a.open_symbol("SKYD")  # the stock's own page
-        root.update()
+        root.process_events()
         for market_open in (True, False):
-            with mock.patch("app.is_live", lambda sym, quote: market_open):
+            with mock.patch("app.is_live", lambda sym, quote, opened=market_open: opened):
                 a.detail.reload()
             assert bool(a.detail.hero.chart.pulse) == market_open
         a.detail.hero.show("1W", "-", [(now - 600, 10.5, 0.0), (now, 11.0, 0.0)], live=True)
@@ -1762,7 +1763,7 @@ def test_pulse_dot_sizes():
         assert small.fps < big.fps  # a few pixels of halo need fewer frames
         for chart in (big, small):
             chart.set_data([1, 2, 3, 2.5], color="#00C805", pulse=True)
-            root.update()
+            root.process_events()
             x0, _, x1, _ = chart.coords("dot")
             assert round((x1 - x0) / 2) == chart.dot_radius
             for monotonic, radius in ((0.0, chart.dot_radius),  # the halo starts as big as the dot...
@@ -1778,7 +1779,7 @@ def test_pulse_dot_sizes():
 
 
 def test_window_maximizes_where_it_can():
-    import tkinter as tk
+    import qt_widgets as qt
     from ui import UI
 
     class Window:
@@ -1788,12 +1789,12 @@ def test_window_maximizes_where_it_can():
         def state(self, name):
             self.calls.append(("state", name))
             if not self.can.get("state"):
-                raise tk.TclError(f'bad argument "{name}": must be normal, iconic, or withdrawn')
+                raise qt.WidgetError(f'bad argument "{name}": must be normal, iconic, or withdrawn')
 
         def attributes(self, *args):
             self.calls.append(("attributes", *args))
             if not self.can.get("attributes"):
-                raise tk.TclError("bad attribute")
+                raise qt.WidgetError("bad attribute")
 
     win = Window(state=True)  # Windows and macOS
     UI.maximize(win)
@@ -1817,7 +1818,7 @@ def test_main_opens_the_window_maximized():
     calls = mock.Mock()  # records the order of the calls that matter
     with mock.patch.multiple(app, data_dir=mock.Mock(return_value=Path("unused")), daily_backup=mock.Mock(),
                              Storage=mock.Mock(), set_language=mock.Mock(), set_theme=mock.Mock(), App=calls.App), \
-            mock.patch.object(app.tk, "Tk", return_value=root), mock.patch.object(app.UI, "setup"), \
+            mock.patch.object(app.qt, "Window", return_value=root), mock.patch.object(app.UI, "setup"), \
             mock.patch.object(app.UI, "maximize", calls.maximize):
         root.mainloop = calls.mainloop
         app.main()
@@ -1846,7 +1847,7 @@ def test_all_accounts_view():
             a.db.add_txn(Txn(account_id=second, **kw))
         a.db.set_prices({"SKYD": D(11), "AAPL": D(155)})
         a.load_accounts(select_id=app.ALL_ACCOUNTS)
-        root.update()
+        root.process_events()
         assert a.combined and a.account_btn.text == i18n.tr("All accounts")
         assert list(a.page_tabs.items) == ["Accounts", "Holdings"] and a.pages["Accounts"].winfo_ismapped()
         assert a.hero.title.cget("text") == "Net worth (all accounts)"
@@ -1861,7 +1862,7 @@ def test_all_accounts_view():
             a.add_txn()
             assert info.called and "Choose one account" in info.call_args[0][1]
         a.open_symbol("SKYD")
-        root.update()
+        root.process_events()
         d = a.detail
         assert d.combined and d.tree.heading(d.tree["columns"][0], "text") == "ACCOUNT"
         assert [d.tree.item(i, "values")[0] for i in d.tree.get_children()] == ["Second", "Test"]
@@ -1872,12 +1873,12 @@ def test_all_accounts_view():
             d._on_double(SimpleNamespace(x=x + 3, y=y + 3))
             assert not edit.called  # no editing from the combined view
         a._select_account(first)  # picking one account leaves the stock page and brings back its own tabs
-        root.update()
+        root.process_events()
         assert a.detail is None and not a.combined and list(a.page_tabs.items) == ["Holdings", "Transactions"]
         assert a.hero.title.cget("text") == "Total assets"
         # drill down from the accounts table
         a._select_account(app.ALL_ACCOUNTS)
-        root.update()
+        root.process_events()
         a.acct_tree.focus(str(second))
         x, y, _, _ = a.acct_tree.bbox(str(second), 0)
         a._on_account_double(SimpleNamespace(x=x + 3, y=y + 3))  # double-click the account's row
@@ -1901,13 +1902,13 @@ def test_all_accounts_net_worth_includes_the_finance_cash_balance():
             a.db.add_txn(Txn(account_id=second, **kw))
         a.db.set_prices({"SKYD": D(11), "AAPL": D(155)})
         a.load_accounts(select_id=app.ALL_ACCOUNTS)
-        root.update()
+        root.process_events()
         # Finance page off: the view is the one it always was
         assert a.net_summary is None and a.hero.title.cget("text") == "Net worth (all accounts)"
         assert a.hero.value.cget("text") == "$25,550.00"  # 7,500 cash + 18,050 holdings
 
         _turn_on_finance(a)  # on, but no month entered yet: still nothing to add
-        root.update()
+        root.process_events()
         assert a.combined and a.net_summary is not None and not a.net_summary[0].winfo_manager()
         assert a.hero.title.cget("text") == "Net worth (all accounts)"
 
@@ -1917,7 +1918,7 @@ def test_all_accounts_net_worth_includes_the_finance_cash_balance():
         a.open_finance()
         a.db.save_finance_month(FinMonth("2026-01", D(1000), {salary: FinEntry(D(500)), card: FinEntry(D(100))}))
         a.close_finance()
-        root.update()
+        root.process_events()
         frame, grid = a.net_summary
         tile = lambda key: tuple(w.cget("text") for w in grid.cells[key])
         assert tile("total") == ("$26,950.00", "= stock accounts net worth + finance cash balance")
@@ -1933,16 +1934,16 @@ def test_all_accounts_net_worth_includes_the_finance_cash_balance():
         assert tile("stock")[0] == "$27,050.00" and tile("total")[0] == "$28,450.00" and tile("finance")[0] == "$1,400.00"
 
         a._select_account(first)  # one account: no summary, the usual title
-        root.update()
+        root.process_events()
         assert not frame.winfo_manager() and a.hero.title.cget("text") == "Total assets"
         a._select_account(app.ALL_ACCOUNTS)
-        root.update()
+        root.process_events()
         assert frame.winfo_manager() and a.hero.title.cget("text") == "Stock accounts net worth"
 
         a.open_finance()  # the month is deleted: back to the plain view
         a.db.delete_finance_month("2026-01")
         a.close_finance()
-        root.update()
+        root.process_events()
         assert not frame.winfo_manager() and a.hero.title.cget("text") == "Net worth (all accounts)"
         a.open_finance()
         a.db.save_finance_month(FinMonth("2026-01", D(-50)))  # a negative balance is shown in the loss color
@@ -1951,7 +1952,7 @@ def test_all_accounts_net_worth_includes_the_finance_cash_balance():
 
         a.v_finance.set(False)  # off again: gone
         a.toggle_finance()
-        root.update()
+        root.process_events()
         assert a.net_summary is None and a.hero.title.cget("text") == "Net worth (all accounts)"
     finally:
         _close_gui(root)
@@ -1964,13 +1965,13 @@ def test_reset_filters_button_only_shows_while_filtering():
     root, a = win
     try:
         a._show_page("Transactions")
-        root.update()
+        root.process_events()
         assert not a.reset_btn.winfo_ismapped()
         a.v_filter_symbol.set("AAPL")
-        root.update()
+        root.process_events()
         assert a.reset_btn.winfo_ismapped() and len(a.txn_tree.get_children()) == 1
         a._clear_filters()  # only the view changes; no transaction is deleted
-        root.update()
+        root.process_events()
         assert not a.reset_btn.winfo_ismapped()
         assert len(a.txn_tree.get_children()) == 3 and len(a.db.list_txns(a.account_id)) == 3
     finally:
@@ -1994,7 +1995,7 @@ def test_transactions_can_be_narrowed_by_period():
         a.db.add_txn(Txn(account_id=acc, date="2019-06-01", type="DEPOSIT", amount=D(900)))
         a.load_accounts(select_id=acc)
         a._show_page("Transactions")
-        root.update()
+        root.process_events()
 
         def shown():
             return sorted(int(float(str(a.txn_tree.set(i, "cash")).replace(",", ""))) for i in a.txn_tree.get_children())
@@ -2007,20 +2008,20 @@ def test_transactions_can_be_narrowed_by_period():
         for label, expected in (("Past month", [10]), ("Past 3 months", [10, 60]), ("Past 6 months", [10, 60, 150]),
                                 ("Past year", [10, 60, 150, 300]), ("2019", [900])):
             a.v_filter_period.set(label)
-            root.update()
+            root.process_events()
             assert shown() == expected, label
         for y in years:  # each calendar year
             a.v_filter_period.set(str(y))
             assert shown() == sorted({d for d in (10, 60, 150, 300) if (today_ - timedelta(days=d)).year == y}
                                      | ({900} if y == 2019 else set())), y
         a.v_filter_period.set("Past 3 months")
-        root.update()
+        root.process_events()
         assert a.txn_count.cget("text") == "Showing 2 of 5" and a.reset_btn.winfo_ismapped()
         assert not a.range_bar.winfo_ismapped()
 
         # a range of your own: two dates, either of which may be left blank
         a.v_filter_period.set("Custom range…")
-        root.update()
+        root.process_events()
         assert a.range_bar.winfo_ismapped() and shown() == [10, 60, 150, 300, 900]  # nothing typed: no limit
         day = lambda n: (today_ - timedelta(days=n)).strftime("%Y/%m/%d")  # any of the date formats works
         a.v_from.set(day(200))
@@ -2053,7 +2054,7 @@ def test_transactions_can_be_narrowed_by_period():
         assert shown() == [10, 60, 150, 300, 900]
 
         a._clear_filters()  # all four filters back to normal, nothing is deleted
-        root.update()
+        root.process_events()
         assert a.v_filter_period.get() == "All time" and a.v_from.get() == "" == a.v_to.get()
         assert not a.range_bar.winfo_ismapped() and not a.reset_btn.winfo_ismapped()
         assert shown() == [10, 60, 150, 300, 900] and len(a.db.list_txns(acc)) == 5
@@ -2081,7 +2082,7 @@ def _finance_page():
     root, a = win
     _turn_on_finance(a)
     a.open_finance()
-    root.update()
+    root.process_events()
     f = a.finance
     salary, interest, other, card, spending = (c.id for c in f.categories)
     f.db.save_finance_month(FinMonth("2025-12", D(1000), {
@@ -2090,7 +2091,7 @@ def _finance_page():
         salary: FinEntry(D("9000")), interest: FinEntry(D("12.5"), "", "bank bonus"),
         spending: FinEntry(D(300), "", "moved to Fidelity\nfor SKYD")}))
     f.refresh()
-    root.update()
+    root.process_events()
     return root, a, f, SimpleNamespace(salary=salary, interest=interest, other=other, card=card, spending=spending)
 
 
@@ -2100,7 +2101,7 @@ def test_finance_page_is_optional():
         return
     root, a = win
     try:
-        root.update()
+        root.process_events()
         tables = lambda: {r[0] for r in a.db.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert not a.v_finance.get() and not a.db.finance_enabled()  # off until you turn it on
         assert len(a.stock_left.winfo_children()) == 1  # only the account menu: no Finance button
@@ -2114,16 +2115,16 @@ def test_finance_page_is_optional():
         assert "Finance page" in labels
 
         _turn_on_finance(a)
-        root.update()
+        root.process_events()
         assert a.db.finance_enabled() and len(a.stock_left.winfo_children()) == 2 and "finance_categories" in tables()
         a.open_finance()
-        root.update()
+        root.process_events()
         assert a.finance is not None and a.finance.winfo_ismapped()
         a.db.save_finance_month(FinMonth("2025-12", D(7)))
 
         a.v_finance.set(False)  # turning it off while it is open goes back to the stock view, keeping the data
         a.toggle_finance()
-        root.update()
+        root.process_events()
         assert a.finance is None and a.body.winfo_ismapped() and len(a.stock_left.winfo_children()) == 1
         assert not a.db.finance_enabled() and "finance_months" in tables()
         a.open_finance()
@@ -2141,10 +2142,10 @@ def test_finance_page_opens_in_place_of_the_stock_view():
     root, a = win
     try:
         _turn_on_finance(a)
-        root.update()
+        root.process_events()
         assert a.finance is None and a.body.winfo_ismapped() and a.stock_left.winfo_ismapped()
         a.open_finance()
-        root.update()
+        root.process_events()
         f = a.finance
         assert f.winfo_ismapped() and f.winfo_toplevel() is root and not a.body.winfo_ismapped()
         assert not a.stock_left.winfo_ismapped() and not a.stock_right.winfo_ismapped()  # the stock controls are hidden
@@ -2162,24 +2163,24 @@ def test_finance_page_opens_in_place_of_the_stock_view():
             a.add_txn()
             assert not need.called
         a.close_finance()
-        root.update()
+        root.process_events()
         assert a.finance is None and not f.winfo_exists() and a.body.winfo_ismapped()
         assert a.stock_left.winfo_ismapped() and a.stock_right.winfo_ismapped() and root.title() == "Stock Ledger"
         a.open_finance()
-        root.update()
+        root.process_events()
         root.event_generate("<Escape>")  # Esc goes back, as from a stock page
-        root.update()
+        root.process_events()
         assert a.finance is None and a.body.winfo_ismapped()
 
         # a stock page that was open is still there afterwards; changing the theme keeps you on the finance page
         a.open_symbol("SKYD")
         a.open_finance()
         a.rebuild()
-        root.update()
+        root.process_events()
         assert a.finance is not None and a.finance.winfo_ismapped() and not a.body.winfo_ismapped()
         assert a.detail is not None and a.detail.symbol == "SKYD" and not a.detail.winfo_ismapped()
         a.close_finance()
-        root.update()
+        root.process_events()
         assert a.body.winfo_ismapped() and a.stock_left.winfo_ismapped()
         assert a.detail.winfo_ismapped() and root.title() == "SKYD · Stock Ledger"  # back on the stock page
     finally:
@@ -2214,14 +2215,14 @@ def test_finance_page_shows_months_like_the_spreadsheet():
         # the details under the table: the sum behind an amount, and the comments
         tree.selection_set("2025-12")
         tree.focus("2025-12")
-        root.update()
+        root.process_events()
         detail = f.detail.get("1.0", "end")
         assert "2025-12" in detail and "Opening 1,000.00 · Income 8,000.00 · Expenses 200.00 · Ending 8,800.00" in detail
         assert "Salary income   8,000.00 = 4000+4000\ntwo paychecks" in detail
         assert "Credit card" not in detail  # nothing to say about a plain amount without a comment
         tree.selection_set("2026-01")
         tree.focus("2026-01")
-        root.update()
+        root.process_events()
         detail = f.detail.get("1.0", "end")
         assert "bank bonus" in detail and "moved to Fidelity\nfor SKYD" in detail and "two paychecks" not in detail
 
@@ -2229,7 +2230,7 @@ def test_finance_page_shows_months_like_the_spreadsheet():
         assert [str(v) for v in f.period_box["values"]] == [
             "All time", "Past 3 months", "Past 6 months", "Past year", "2026", "2025", "Custom range…"]
         f.v_period.set("2026")
-        root.update()
+        root.process_events()
         assert tree.get_children() == ("2026-01", "total")
         assert values("total")[:2] == ["Total", "8,800.00"] and text("income") == ("$9,012.50", "$9,012.50 / month")
         assert text("net") == ("+$8,712.50", "1 month")
@@ -2258,14 +2259,14 @@ def test_finance_page_shows_months_like_the_spreadsheet():
 
 
 def test_finance_totals_for_a_period():
-    import tkinter as tk
+    import qt_widgets as qt
 
     ready = _finance_page()
     if ready is None:
         return
     root, a, f, ids = ready
     try:
-        texts = lambda: [w.cget("text") for w in f.totals.winfo_children() if isinstance(w, tk.Label)]
+        texts = lambda: [w.cget("text") for w in f.totals.winfo_children() if isinstance(w, qt.Label)]
         everything = texts()
         assert everything[:2] == ["Totals for the period", "2025-12 to 2026-01 · 2 months"]
         # the figures for a tax return: every category over the period, and the totals under them
@@ -2283,7 +2284,7 @@ def test_finance_totals_for_a_period():
 
         # a range of your own: the first and last month, or any dates within them
         f.v_period.set("Custom range…")
-        root.update()
+        root.process_events()
         assert f.range_bar.winfo_ismapped() and len(f.tree.get_children()) == 3  # nothing typed: no limit
         f.v_from.set("2026-01")
         assert f.tree.get_children() == ("2026-01", "total")
@@ -2301,7 +2302,7 @@ def test_finance_totals_for_a_period():
         f.v_from.set("")
         f.v_to.set("")
         f.v_period.set("All time")
-        root.update()
+        root.process_events()
         assert not f.range_bar.winfo_ismapped() and len(f.tree.get_children()) == 3
     finally:
         _close_gui(root)
@@ -2357,7 +2358,7 @@ def test_finance_months_can_be_added_edited_and_deleted():
             assert kw["month"] == "2026-02" and kw["initial"] is None and kw["existing"] == {"2025-12", "2026-01"}
             assert kw["carried"]("2026-02") == D("17512.50") and kw["carried"]("2025-12") == 0  # nothing before the first
             assert kw["categories"] == f.categories
-        root.update()
+        root.process_events()
         assert f.tree.get_children() == ("2025-12", "2026-01", "2026-02", "total")
         assert f.tree.focus() == "2026-02"  # the new month is selected
         assert str(f.tree.item("2026-02", "values")[-1]) == "17,582.50"
@@ -2469,9 +2470,9 @@ def test_finance_month_dialog():
         # Tab in a comment box moves on instead of typing a tab
         box = d.comments[ids.salary]
         box.focus_force()
-        root.update()
+        root.process_events()
         box.event_generate("<Tab>")
-        root.update()
+        root.process_events()
         assert "\t" not in box.get("1.0", "end")
         # a new dialog starts on the first amount
         assert dialog().initial_focus is made[-1].amount_entries[ids.salary]
@@ -2542,7 +2543,7 @@ def test_finance_categories_dialog():
         with mock.patch.object(app, "FinanceCategoriesDialog") as dialog:
             dialog.return_value.show.return_value = result
             f.edit_categories()
-        root.update()
+        root.process_events()
         assert [(c.kind, c.name) for c in f.categories] == [
             ("income", "Bank interest"), ("income", "Other income"), ("income", "Rental income"),
             ("expense", "Credit card payments"), ("expense", "Other expenses"), ("expense", "Salary income")]
@@ -2620,7 +2621,7 @@ def test_exporting_the_finance_page_to_csv():
         assert _more_menu_commands(a)["Export finance to CSV…"] == "normal"
         assert _more_menu_commands(a)["Export current account to CSV…"] == "disabled"
         a.close_finance()
-        root.update()
+        root.process_events()
         assert _more_menu_commands(a)["Export finance to CSV…"] == "normal"
         assert _more_menu_commands(a)["Export current account to CSV…"] == "normal"
 
@@ -2675,7 +2676,7 @@ def test_finance_page_in_chinese():
         a.rebuild()
         _turn_on_finance(a)
         a.open_finance()
-        root.update()
+        root.process_events()
         f = a.finance
         assert [c.name for c in f.categories] == ["工资收入", "利息收入", "杂项收入", "信用卡还款", "杂项支出"]  # as in the sheet
         assert [f.tree.heading(c, "text") for c in f.tree["columns"]][:2] == ["月份", "起始资金"]

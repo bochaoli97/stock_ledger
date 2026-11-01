@@ -1,7 +1,8 @@
 """
 app.py -- Stock Ledger (GUI)
 
-Uses only the Python standard library (tkinter + sqlite3); nothing to pip install.
+Uses PyQt6 for the native desktop UI and sqlite3 for local storage.
+Install: python -m pip install -r requirements.txt
 Run:    python app.py
 Build:  run build_exe.bat on Windows to get dist\\StockLedger\\StockLedger.exe (a folder build)
 
@@ -24,11 +25,12 @@ import subprocess
 import sys
 import threading
 import time
-import tkinter as tk
+import qt_widgets as qt
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from qt_widgets import filedialog, messagebox
+from ticker import TickerLabel
 
 from csv_export import finance_tables, stock_tables, write_tables
 from i18n import DEFAULT_LANGUAGE, LANGUAGES, language, set_language, tr
@@ -258,7 +260,7 @@ def all_range(first_date: str) -> tuple[str, str]:
 # ======================================================================
 # Dialog base class
 # ======================================================================
-class Dialog(tk.Toplevel):
+class Dialog(qt.Toplevel):
     def __init__(self, parent, title: str):
         super().__init__(parent, bg=C["bg"])
         self.withdraw()
@@ -269,18 +271,18 @@ class Dialog(tk.Toplevel):
         self.result = None
         self.initial_focus = None
         label(self, title, font=UI.h2).pack(anchor="w", padx=UI.px(20), pady=(UI.px(18), 0))
-        self.body = ttk.Frame(self, padding=(UI.px(20), UI.px(12), UI.px(20), UI.px(16)))
+        self.body = qt.Frame(self, padding=(UI.px(20), UI.px(12), UI.px(20), UI.px(16)))
         self.body.pack(fill="both", expand=True)
         self.protocol("WM_DELETE_WINDOW", self.cancel)
         self.bind("<Escape>", lambda e: self.cancel())
 
     def add_buttons(self, ok_text: str | None = None) -> None:
-        bar = tk.Frame(self, bg=C["bg"])
+        bar = qt.Frame(self, bg=C["bg"])
         bar.pack(fill="x", padx=UI.px(20), pady=(0, UI.px(18)))
         PillButton(bar, ok_text or tr("Save"), self.ok, "primary").pack(side="right")
         PillButton(bar, tr("Cancel"), self.cancel, "secondary").pack(side="right", padx=(0, UI.px(8)))
         # Enter = save (except inside a multi-line text box)
-        self.bind("<Return>", lambda e: None if isinstance(e.widget, tk.Text) else self.ok())
+        self.bind("<Return>", lambda e: None if isinstance(e.widget, qt.Text) else self.ok())
 
     def show(self, focus=None):
         self.update_idletasks()
@@ -288,8 +290,8 @@ class Dialog(tk.Toplevel):
         x = p.winfo_rootx() + (p.winfo_width() - self.winfo_reqwidth()) // 2
         y = p.winfo_rooty() + (p.winfo_height() - self.winfo_reqheight()) // 3
         self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-        self.deiconify()
         self.grab_set()
+        self.deiconify()
         (focus or self.initial_focus or self).focus_set()
         self.wait_window()
         return self.result
@@ -352,24 +354,24 @@ class TxnDialog(Dialog):
         self.initial = initial
 
         t = initial
-        self.v_date = tk.StringVar(value=t.date if t else (default_date or today()))
+        self.v_date = qt.StringVar(value=t.date if t else (default_date or today()))
         self.type_by_label = {tr(text): code for code, text in TXN_TYPES.items()}
-        self.v_type = tk.StringVar(value=tr(TXN_TYPES[t.type if t else default_type]))
-        self.v_symbol = tk.StringVar(value=t.symbol if t else default_symbol)
-        self.v_symbol2 = tk.StringVar(value=t.symbol2 if t else "")
-        self.v_qty = tk.StringVar(value=self._num(t.quantity) if t else "")
-        self.v_price = tk.StringVar(value=self._num(t.price) if t else "")
-        self.v_fee = tk.StringVar(value=self._num(t.fee) if t else "")
-        self.v_amount = tk.StringVar(value=self._num(t.amount) if t else "")
-        self.v_note = tk.StringVar(value=t.note if t else "")
+        self.v_type = qt.StringVar(value=tr(TXN_TYPES[t.type if t else default_type]))
+        self.v_symbol = qt.StringVar(value=t.symbol if t else default_symbol)
+        self.v_symbol2 = qt.StringVar(value=t.symbol2 if t else "")
+        self.v_qty = qt.StringVar(value=self._num(t.quantity) if t else "")
+        self.v_price = qt.StringVar(value=self._num(t.price) if t else "")
+        self.v_fee = qt.StringVar(value=self._num(t.fee) if t else "")
+        self.v_amount = qt.StringVar(value=self._num(t.amount) if t else "")
+        self.v_note = qt.StringVar(value=t.note if t else "")
 
         b = self.body
         pad = {"padx": (0, UI.px(14)), "pady": UI.px(5)}
-        self.rows: dict[str, list[tk.Widget]] = {}
-        self.labels: dict[str, ttk.Label] = {}
+        self.rows: dict[str, list[qt.Widget]] = {}
+        self.labels: dict[str, qt.Label] = {}
 
         def add_row(key, r, text, widget, extra=None):
-            lbl = ttk.Label(b, text=text, style="Muted.TLabel")
+            lbl = qt.Label(b, text=text, style="Muted.TLabel")
             lbl.grid(row=r, column=0, sticky="w", **pad)
             widget.grid(row=r, column=1, sticky="we", pady=UI.px(5))
             widgets = [lbl, widget]
@@ -379,33 +381,33 @@ class TxnDialog(Dialog):
             self.rows[key] = widgets
             self.labels[key] = lbl
 
-        add_row("date", 0, tr("Date"), ttk.Entry(b, textvariable=self.v_date, width=24),
-                ttk.Button(b, text=tr("Today"), width=6, command=lambda: self.v_date.set(today())))
-        self.type_box = ttk.Combobox(b, textvariable=self.v_type, values=list(self.type_by_label),
+        add_row("date", 0, tr("Date"), qt.Entry(b, textvariable=self.v_date, width=24),
+                qt.Button(b, text=tr("Today"), width=6, command=lambda: self.v_date.set(today())))
+        self.type_box = qt.Combobox(b, textvariable=self.v_type, values=list(self.type_by_label),
                                      state="readonly", width=22)
         add_row("type", 1, tr("Type"), self.type_box)
         self.symbol_box = SymbolEntry(b, self.v_symbol, suggest, width=24)
         add_row("symbol", 2, tr("Symbol"), self.symbol_box)
         self.symbol2_box = SymbolEntry(b, self.v_symbol2, suggest, width=24)
         add_row("symbol2", 3, tr("New symbol"), self.symbol2_box)
-        self.qty_entry = ttk.Entry(b, textvariable=self.v_qty, width=24, justify="right")
-        self.all_btn = ttk.Button(b, text=tr("All"), width=6, command=self._fill_all)
+        self.qty_entry = qt.Entry(b, textvariable=self.v_qty, width=24, justify="right")
+        self.all_btn = qt.Button(b, text=tr("All"), width=6, command=self._fill_all)
         add_row("quantity", 4, tr("Quantity (shares)"), self.qty_entry, self.all_btn)
-        add_row("price", 5, tr("Price"), ttk.Entry(b, textvariable=self.v_price, width=24, justify="right"))
-        add_row("fee", 6, tr("Fee"), ttk.Entry(b, textvariable=self.v_fee, width=24, justify="right"))
-        self.amount_entry = ttk.Entry(b, textvariable=self.v_amount, width=24, justify="right")
+        add_row("price", 5, tr("Price"), qt.Entry(b, textvariable=self.v_price, width=24, justify="right"))
+        add_row("fee", 6, tr("Fee"), qt.Entry(b, textvariable=self.v_fee, width=24, justify="right"))
+        self.amount_entry = qt.Entry(b, textvariable=self.v_amount, width=24, justify="right")
         add_row("amount", 7, tr("Amount"), self.amount_entry)
-        add_row("note", 8, tr("Note"), ttk.Entry(b, textvariable=self.v_note, width=24))
+        add_row("note", 8, tr("Note"), qt.Entry(b, textvariable=self.v_note, width=24))
 
-        self.hint = ttk.Label(b, style="Muted.TLabel", wraplength=UI.px(380), justify="left")
+        self.hint = qt.Label(b, style="Muted.TLabel", wraplength=UI.px(380), justify="left")
         self.hint.grid(row=9, column=0, columnspan=3, sticky="w", pady=(UI.px(10), 0))
-        self.preview = ttk.Label(b, wraplength=UI.px(380), justify="left")
+        self.preview = qt.Label(b, wraplength=UI.px(380), justify="left")
         self.preview.grid(row=10, column=0, columnspan=3, sticky="w", pady=(UI.px(6), 0))
         b.columnconfigure(1, weight=1)
 
         self.type_box.bind("<<ComboboxSelected>>", lambda e: self._on_type())
         for box in (self.symbol_box, self.symbol2_box):
-            box.bind("<<SymbolPicked>>", lambda e: e.widget.tk_focusNext().focus_set())
+            box.bind("<<SymbolPicked>>", lambda e: e.widget.focusNextChild())
         for v in (self.v_symbol, self.v_symbol2, self.v_qty, self.v_price, self.v_fee, self.v_amount):
             v.trace_add("write", lambda *a: self._update_preview())
         self.add_buttons()
@@ -513,32 +515,32 @@ class AccountDialog(Dialog):
     def __init__(self, parent, title, *, suggest, initial=None):
         super().__init__(parent, title)
         self.is_new = initial is None
-        self.v_name = tk.StringVar(value=initial["name"] if initial else "")
-        self.v_broker = tk.StringVar(value=initial["broker"] if initial else "Fidelity")
-        self.v_note = tk.StringVar(value=initial["note"] if initial else "")
-        self.v_date = tk.StringVar(value=today())
-        self.v_cash = tk.StringVar()
+        self.v_name = qt.StringVar(value=initial["name"] if initial else "")
+        self.v_broker = qt.StringVar(value=initial["broker"] if initial else "Fidelity")
+        self.v_note = qt.StringVar(value=initial["note"] if initial else "")
+        self.v_date = qt.StringVar(value=today())
+        self.v_cash = qt.StringVar()
 
         b = self.body
         pad = {"padx": (0, UI.px(14)), "pady": UI.px(5), "sticky": "w"}
-        ttk.Label(b, text=tr("Account name *"), style="Muted.TLabel").grid(row=0, column=0, **pad)
-        self.name_entry = ttk.Entry(b, textvariable=self.v_name, width=34)
+        qt.Label(b, text=tr("Account name *"), style="Muted.TLabel").grid(row=0, column=0, **pad)
+        self.name_entry = qt.Entry(b, textvariable=self.v_name, width=34)
         self.name_entry.grid(row=0, column=1, sticky="we", pady=UI.px(4))
-        ttk.Label(b, text=tr("Broker"), style="Muted.TLabel").grid(row=1, column=0, **pad)
-        ttk.Entry(b, textvariable=self.v_broker, width=34).grid(row=1, column=1, sticky="we", pady=UI.px(4))
-        ttk.Label(b, text=tr("Note"), style="Muted.TLabel").grid(row=2, column=0, **pad)
-        ttk.Entry(b, textvariable=self.v_note, width=34).grid(row=2, column=1, sticky="we", pady=UI.px(4))
+        qt.Label(b, text=tr("Broker"), style="Muted.TLabel").grid(row=1, column=0, **pad)
+        qt.Entry(b, textvariable=self.v_broker, width=34).grid(row=1, column=1, sticky="we", pady=UI.px(4))
+        qt.Label(b, text=tr("Note"), style="Muted.TLabel").grid(row=2, column=0, **pad)
+        qt.Entry(b, textvariable=self.v_note, width=34).grid(row=2, column=1, sticky="we", pady=UI.px(4))
 
         if self.is_new:
             separator(b).grid(row=3, column=0, columnspan=2, sticky="we", pady=UI.px(14))
             label(b, tr("Opening balances"), font=UI.bold).grid(row=4, column=0, columnspan=2, sticky="w")
-            ttk.Label(b, text=tr("Optional, can be added later"), style="Muted.TLabel").grid(
+            qt.Label(b, text=tr("Optional, can be added later"), style="Muted.TLabel").grid(
                 row=5, column=0, columnspan=2, sticky="w", pady=(0, UI.px(6)))
-            ttk.Label(b, text=tr("Opening date"), style="Muted.TLabel").grid(row=6, column=0, **pad)
-            ttk.Entry(b, textvariable=self.v_date, width=34).grid(row=6, column=1, sticky="we", pady=UI.px(4))
-            ttk.Label(b, text=tr("Opening cash"), style="Muted.TLabel").grid(row=7, column=0, **pad)
-            ttk.Entry(b, textvariable=self.v_cash, width=34, justify="right").grid(row=7, column=1, sticky="we", pady=UI.px(4))
-            ttk.Label(b, text=tr("Opening positions"), style="Muted.TLabel").grid(
+            qt.Label(b, text=tr("Opening date"), style="Muted.TLabel").grid(row=6, column=0, **pad)
+            qt.Entry(b, textvariable=self.v_date, width=34).grid(row=6, column=1, sticky="we", pady=UI.px(4))
+            qt.Label(b, text=tr("Opening cash"), style="Muted.TLabel").grid(row=7, column=0, **pad)
+            qt.Entry(b, textvariable=self.v_cash, width=34, justify="right").grid(row=7, column=1, sticky="we", pady=UI.px(4))
+            qt.Label(b, text=tr("Opening positions"), style="Muted.TLabel").grid(
                 row=8, column=0, padx=(0, UI.px(14)), pady=(UI.px(22), 0), sticky="nw")
             self._build_position_editor(b, suggest).grid(row=8, column=1, sticky="we", pady=UI.px(5))
         b.columnconfigure(1, weight=1)
@@ -546,17 +548,17 @@ class AccountDialog(Dialog):
         self.initial_focus = self.name_entry
 
     # --- opening positions: fill in the cells, press + (or Enter) to add a row to the list
-    def _build_position_editor(self, parent, suggest) -> tk.Frame:
-        ed = tk.Frame(parent, bg=C["bg"])
-        self.v_pos_sym, self.v_pos_qty, self.v_pos_cost = tk.StringVar(), tk.StringVar(), tk.StringVar()
+    def _build_position_editor(self, parent, suggest) -> qt.Frame:
+        ed = qt.Frame(parent, bg=C["bg"])
+        self.v_pos_sym, self.v_pos_qty, self.v_pos_cost = qt.StringVar(), qt.StringVar(), qt.StringVar()
         self.opening_positions: list[tuple[str, Decimal, Decimal]] = []  # (symbol, shares, cost per share)
         for col, text in enumerate(("SYMBOL", "SHARES", "COST / SHARE")):
             label(ed, tr(text), font=UI.small_bold, color=C["muted"]).grid(row=0, column=col, sticky="w",
                                                                      padx=(0, UI.px(6)), pady=(0, UI.px(3)))
         self.pos_sym_entry = SymbolEntry(ed, self.v_pos_sym, suggest, width=9)
         entries = (self.pos_sym_entry,
-                   ttk.Entry(ed, textvariable=self.v_pos_qty, width=10, justify="right"),
-                   ttk.Entry(ed, textvariable=self.v_pos_cost, width=11, justify="right"))
+                   qt.Entry(ed, textvariable=self.v_pos_qty, width=10, justify="right"),
+                   qt.Entry(ed, textvariable=self.v_pos_cost, width=11, justify="right"))
         for col, e in enumerate(entries):
             e.grid(row=1, column=col, sticky="we", padx=(0, UI.px(6)))
             e.bind("<Return>", lambda ev: (self._add_position(), "break")[1])  # Enter adds the row, not save
@@ -656,7 +658,7 @@ class PriceDialog(Dialog):
                   "Use this for holdings without one (e.g. CDs or private funds). Leave blank to clear.") if live else \
             tr("Live prices are off, so prices are entered by hand. They are used to compute market value "
                "and unrealized P/L. Leave blank to clear.")
-        ttk.Label(b, style="Muted.TLabel", justify="left", wraplength=UI.px(420), text=text).pack(
+        qt.Label(b, style="Muted.TLabel", justify="left", wraplength=UI.px(420), text=text).pack(
             anchor="w", pady=(0, UI.px(10)))
 
         scroll = ScrollFrame(b)
@@ -665,15 +667,15 @@ class PriceDialog(Dialog):
         for col, text in enumerate(("SYMBOL", "SHARES", "PRICE", "LAST UPDATED")):
             label(inner, tr(text), font=UI.small_bold, color=C["muted"]).grid(row=0, column=col, sticky="w",
                                                                         padx=UI.px(6), pady=UI.px(4))
-        self.vars: dict[str, tk.StringVar] = {}
+        self.vars: dict[str, qt.StringVar] = {}
         self.first_entry = None
         for r, p in enumerate(positions, start=1):
             old = prices.get(p.symbol)
-            var = tk.StringVar(value=format(old[0].normalize(), "f") if old else "")
+            var = qt.StringVar(value=format(old[0].normalize(), "f") if old else "")
             self.vars[p.symbol] = var
             label(inner, p.symbol, font=UI.bold).grid(row=r, column=0, sticky="w", padx=UI.px(6))
             label(inner, fmt_qty(p.quantity)).grid(row=r, column=1, sticky="e", padx=UI.px(6))
-            e = ttk.Entry(inner, textvariable=var, width=14, justify="right")
+            e = qt.Entry(inner, textvariable=var, width=14, justify="right")
             e.grid(row=r, column=2, padx=UI.px(6), pady=UI.px(3))
             self.first_entry = self.first_entry or e
             label(inner, old[1] if old else "-", color=C["muted"]).grid(row=r, column=3, sticky="w", padx=UI.px(6))
@@ -699,14 +701,14 @@ class PriceDialog(Dialog):
 # ======================================================================
 # Shared pieces of the main window and the stock page
 # ======================================================================
-class StatGrid(tk.Frame):
+class StatGrid(qt.Frame):
     """Grid of small 'LABEL / value / note' stats."""
 
     def __init__(self, parent, specs: list[tuple[str, str]], columns: int = 4, notes: bool = True):
         super().__init__(parent, bg=C["bg"])
-        self.cells: dict[str, tuple[tk.Label, tk.Label]] = {}
+        self.cells: dict[str, tuple[qt.Label, qt.Label]] = {}
         for i, (key, title) in enumerate(specs):
-            cell = tk.Frame(self, bg=C["bg"])
+            cell = qt.Frame(self, bg=C["bg"])
             cell.grid(row=i // columns, column=i % columns, sticky="nw", pady=(0, UI.px(12)))
             label(cell, title.upper(), font=UI.small_bold, color=C["muted"]).pack(anchor="w")
             value = label(cell, "-", font=UI.stat)
@@ -724,16 +726,16 @@ class StatGrid(tk.Frame):
         n.configure(text=note)
 
 
-class Hero(tk.Frame):
+class Hero(qt.Frame):
     """Big number, the change under it, a line chart and range tabs -- the top of a Robinhood page."""
 
     def __init__(self, parent, title: str, on_range, chart_height=210, slots_1d=DAY_SLOTS):
         super().__init__(parent, bg=C["bg"])
         self.title = label(self, title, font=UI.bold, color=C["muted"])
         self.title.pack(anchor="w")
-        self.value = label(self, "-", font=UI.hero)
+        self.value = TickerLabel(self, text="-", font=UI.hero, bg=C["bg"], fg=C["text"])
         self.value.pack(anchor="w")
-        row = tk.Frame(self, bg=C["bg"])
+        row = qt.Frame(self, bg=C["bg"])
         row.pack(anchor="w", pady=(0, UI.px(8)))
         self.change = label(row, "", font=UI.bold)
         self.change.pack(side="left")
@@ -746,6 +748,7 @@ class Hero(tk.Frame):
         self.tabs.pack(anchor="w", pady=(UI.px(6), 0))
         self.slots_1d = slots_1d
         self.rng = "1D"
+        self._scrub_index = None
         self.points: list[tuple[int, float, float]] = []  # (time, value, net deposits)
         self.baseline: float | None = None
         self.now: tuple[str, str, str, str] = ("-", "", "", "")  # value, change, color, period
@@ -755,6 +758,8 @@ class Hero(tk.Frame):
         """points: [(unix time, value, net deposits)]; change is measured against `baseline` if given
         (1D: previous close), otherwise against the first point with deposits/withdrawals taken out.
         live: the market is open (quotes.is_live), so today's line ends in a pulsing dot."""
+        if rng != self.rng:
+            self._scrub_index = None
         self.rng = rng
         self.points = points
         self.baseline = baseline
@@ -768,7 +773,7 @@ class Hero(tk.Frame):
                             labels=[time_label(p[0], rng) for p in points],
                             slots=self.slots_1d if rng == "1D" else 0, message=message, pulse=live and rng == "1D")
         self.tabs.set_accent(color)
-        self._hover(None)
+        self._hover(self._scrub_index if self._scrub_index is not None and self._scrub_index < len(points) else None)
 
     def _change(self, i):
         t, v, n = self.points[i]
@@ -779,12 +784,13 @@ class Hero(tk.Frame):
         return (v - v0) - flows, (v0 + flows if v0 + flows > 0 else None)
 
     def _hover(self, i):
+        self._scrub_index = i
         if i is None:
             value, change, color, period = self.now
         else:
             ch, base = self._change(i)
             value, change, color, period = usd(self.points[i][1]), change_text(ch, base), color_for(ch), ""
-        self.value.configure(text=value)
+        self.value.set_text(value, flash=i is None)
         self.change.configure(text=change, fg=color)
         self.period.configure(text=period)
 
@@ -812,7 +818,7 @@ class SymbolDetail(PageScroll):
         self.rng = "1D"
 
         page = self.inner
-        top = tk.Frame(page, bg=C["bg"])
+        top = qt.Frame(page, bg=C["bg"])
         top.pack(fill="x")
         PillButton(top, tr("Back"), app.close_detail, "ghost", icon="back", padx=12, pady=5).pack(side="left")
         for code, kind in (() if self.combined else (("BUY", "primary"), ("SELL", "outline"), ("DIVIDEND", "secondary"))):
@@ -957,10 +963,10 @@ def cell_text(entry: FinEntry | None) -> str:
     return f"• {text}" if entry is not None and entry.comment else text
 
 
-def comment_box(parent, width: int, text: str = "", rows: tuple[int, int] = (2, 6)) -> tk.Text:
+def comment_box(parent, width: int, text: str = "", rows: tuple[int, int] = (2, 6)) -> qt.Text:
     """A multi-line text box that looks like the entry boxes, as tall as what is written in it (between the
     fewest and most lines in `rows`). Tab moves on instead of typing a tab."""
-    box = tk.Text(parent, width=width, height=rows[0], wrap="word", font=UI.body, bg=C["chip"], fg=C["text"],
+    box = qt.Text(parent, width=width, height=rows[0], wrap="word", font=UI.body, bg=C["chip"], fg=C["text"],
                   insertbackground=C["text"], relief="flat", bd=0, highlightthickness=1, undo=True,
                   highlightbackground=C["chip"], highlightcolor=C["accent"], padx=UI.px(6), pady=UI.px(4))
     box.insert("1.0", text)
@@ -970,7 +976,7 @@ def comment_box(parent, width: int, text: str = "", rows: tuple[int, int] = (2, 
         box.configure(height=min(max(lines, rows[0]), rows[1]))
 
     box.bind("<KeyRelease>", fit, add="+")
-    box.bind("<Tab>", lambda e: (e.widget.tk_focusNext().focus_set(), "break")[1])
+    box.bind("<Tab>", lambda e: (e.widget.focusNextChild(), "break")[1])
     fit()
     return box
 
@@ -985,26 +991,26 @@ class FinanceMonthDialog(Dialog):
         self.existing = existing  # months that are in the table already
         self.carried = carried  # month -> the ending balance of the month before it
         self.is_new = initial is None
-        self.v_month = tk.StringVar(value=month)
-        self.v_opening = tk.StringVar(
+        self.v_month = qt.StringVar(value=month)
+        self.v_opening = qt.StringVar(
             value=format(initial.opening, "f") if initial and initial.opening is not None else "")
-        self.v_amount: dict[int, tk.StringVar] = {}  # category id -> what is typed in its amount box
-        self.sums: dict[int, tk.Label] = {}  # category id -> the "= 2,501.00" next to a sum
-        self.comments: dict[int, tk.Text] = {}
-        self.amount_entries: dict[int, ttk.Entry] = {}
+        self.v_amount: dict[int, qt.StringVar] = {}  # category id -> what is typed in its amount box
+        self.sums: dict[int, qt.Label] = {}  # category id -> the "= 2,501.00" next to a sum
+        self.comments: dict[int, qt.Text] = {}
+        self.amount_entries: dict[int, qt.Entry] = {}
 
-        top = tk.Frame(self.body, bg=C["bg"])
+        top = qt.Frame(self.body, bg=C["bg"])
         top.pack(fill="x")
-        ttk.Label(top, text=tr("Month"), style="Muted.TLabel").grid(row=0, column=0, sticky="w",
+        qt.Label(top, text=tr("Month"), style="Muted.TLabel").grid(row=0, column=0, sticky="w",
                                                                     padx=(0, UI.px(14)), pady=UI.px(5))
-        self.month_entry = ttk.Entry(top, textvariable=self.v_month, width=12)
+        self.month_entry = qt.Entry(top, textvariable=self.v_month, width=12)
         self.month_entry.grid(row=0, column=1, sticky="w")
         if not self.is_new:
             self.month_entry.state(["readonly"])
-        ttk.Label(top, text=tr("Opening balance"), style="Muted.TLabel").grid(row=1, column=0, sticky="w",
+        qt.Label(top, text=tr("Opening balance"), style="Muted.TLabel").grid(row=1, column=0, sticky="w",
                                                                               padx=(0, UI.px(14)), pady=UI.px(5))
-        ttk.Entry(top, textvariable=self.v_opening, width=16, justify="right").grid(row=1, column=1, sticky="w")
-        self.opening_hint = ttk.Label(top, style="Muted.TLabel")
+        qt.Entry(top, textvariable=self.v_opening, width=16, justify="right").grid(row=1, column=1, sticky="w")
+        self.opening_hint = qt.Label(top, style="Muted.TLabel")
         self.opening_hint.grid(row=1, column=2, sticky="w", padx=(UI.px(10), 0))
 
         self.scroll = ScrollFrame(self.body)
@@ -1022,10 +1028,10 @@ class FinanceMonthDialog(Dialog):
                 row += 1
             entry = initial.entries.get(c.id) if initial else None
             typed = (entry.expr or format(entry.amount.normalize(), "f")) if entry and entry.amount else ""
-            self.v_amount[c.id] = var = tk.StringVar(value=typed)
+            self.v_amount[c.id] = var = qt.StringVar(value=typed)
             label(inner, c.name, anchor="w", justify="left", wraplength=UI.px(170)).grid(
                 row=row, column=0, sticky="nw", padx=(0, UI.px(10)), pady=(UI.px(8), 0))
-            self.amount_entries[c.id] = ttk.Entry(inner, textvariable=var, width=28, justify="right")
+            self.amount_entries[c.id] = qt.Entry(inner, textvariable=var, width=28, justify="right")
             self.amount_entries[c.id].grid(row=row, column=1, sticky="nw", padx=(0, UI.px(6)), pady=UI.px(4))
             self.sums[c.id] = label(inner, "", font=UI.small, color=C["muted"], anchor="w", width=13)
             self.sums[c.id].grid(row=row, column=2, sticky="nw", padx=(0, UI.px(10)), pady=(UI.px(10), 0))
@@ -1040,7 +1046,7 @@ class FinanceMonthDialog(Dialog):
 
         self.summary = label(self.body, "", font=UI.bold, anchor="w")
         self.summary.pack(anchor="w", pady=(UI.px(12), 0))
-        ttk.Label(self.body, style="Muted.TLabel", wraplength=UI.px(560), justify="left",
+        qt.Label(self.body, style="Muted.TLabel", wraplength=UI.px(560), justify="left",
                   text=tr("An amount can be a sum, like 1250.50+1250.50; the parts are kept so you can see them later.")
                   ).pack(anchor="w", pady=(UI.px(4), 0))
         for v in (self.v_month, self.v_opening):
@@ -1057,7 +1063,7 @@ class FinanceMonthDialog(Dialog):
             total, shown = self.scroll.inner.winfo_height(), self.scroll.canvas.winfo_height()
             if widget in self.amount_entries.values() and total > shown:
                 self.scroll.canvas.yview_moveto(min(max((widget.winfo_y() - UI.px(40)) / total, 0), 1))
-        except tk.TclError:  # the dialog was closed meanwhile
+        except qt.WidgetError:  # the dialog was closed meanwhile
             pass
 
     def _update_row(self, cid: int) -> None:
@@ -1119,32 +1125,32 @@ class FinanceCategoriesDialog(Dialog):
         self.used = used  # category id -> in how many months it has an amount or a comment
         self.items = {kind: [(c.id, c.name) for c in categories if c.kind == kind] for kind in (INCOME, EXPENSE)}
         self.removed: list[int] = []  # ids of existing categories taken out of the lists
-        self.boxes: dict[str, tk.Listbox] = {}
-        self.v_name = {kind: tk.StringVar() for kind in (INCOME, EXPENSE)}
+        self.boxes: dict[str, qt.Listbox] = {}
+        self.v_name = {kind: qt.StringVar() for kind in (INCOME, EXPENSE)}
 
         b = self.body
-        ttk.Label(b, style="Muted.TLabel", wraplength=UI.px(560), justify="left",
+        qt.Label(b, style="Muted.TLabel", wraplength=UI.px(560), justify="left",
                   text=tr("Type a name and press Add. To change a name, select it, edit the text and press Rename."),
                   ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, UI.px(10)))
         for col, kind in enumerate((INCOME, EXPENSE)):
-            panel = tk.Frame(b, bg=C["bg"])
+            panel = qt.Frame(b, bg=C["bg"])
             panel.grid(row=1, column=col, sticky="n", padx=(0, UI.px(24)) if col == 0 else 0)
             label(panel, tr("Income" if kind == INCOME else "Expenses"), font=UI.bold).pack(anchor="w", pady=(0, UI.px(4)))
-            box = tk.Listbox(panel, height=9, width=24, exportselection=False, activestyle="none", bd=0, relief="flat",
+            box = qt.Listbox(panel, height=9, width=24, exportselection=False, activestyle="none", bd=0, relief="flat",
                              highlightthickness=1, highlightbackground=C["border"], highlightcolor=C["accent"],
                              bg=C["chip"], fg=C["text"], selectbackground=C["chip_hover"],
                              selectforeground=C["text"], font=UI.body)
             box.pack(fill="x")
             box.bind("<<ListboxSelect>>", lambda e, k=kind: self._picked(k))
             self.boxes[kind] = box
-            entry = ttk.Entry(panel, textvariable=self.v_name[kind], width=24)
+            entry = qt.Entry(panel, textvariable=self.v_name[kind], width=24)
             entry.pack(fill="x", pady=(UI.px(8), UI.px(6)))
             entry.bind("<Return>", lambda e, k=kind: (self._add(k), "break")[1])  # Enter adds, it does not save
-            bar = tk.Frame(panel, bg=C["bg"])
+            bar = qt.Frame(panel, bg=C["bg"])
             bar.pack(anchor="w")
             for text, fn in ((tr("Add"), self._add), (tr("Rename"), self._rename), (tr("Delete"), self._delete),
                              (tr("Up"), lambda k: self._move(k, -1)), (tr("Down"), lambda k: self._move(k, 1))):
-                ttk.Button(bar, text=text, width=6, command=lambda fn=fn, k=kind: fn(k)).pack(
+                qt.Button(bar, text=text, width=6, command=lambda fn=fn, k=kind: fn(k)).pack(
                     side="left", padx=(0, UI.px(4)))
             self._render(kind)
         self.add_buttons()
@@ -1241,14 +1247,14 @@ class FinancePage(PageScroll):
         self.months: list[FinMonth] = []
         self.rows: list[FinRow] = []  # every month with its totals
         self.shown: list[FinRow] = []  # the months of the chosen period
-        self.v_period = tk.StringVar(value=tr(FINANCE_PERIODS["ALL"]))
-        self.v_from = tk.StringVar()  # the first and last month of a custom range; blank = no limit on that side
-        self.v_to = tk.StringVar()
+        self.v_period = qt.StringVar(value=tr(FINANCE_PERIODS["ALL"]))
+        self.v_from = qt.StringVar()  # the first and last month of a custom range; blank = no limit on that side
+        self.v_to = qt.StringVar()
         self.period_codes: dict[str, str] = {}  # the period choices as shown -> their codes (see refresh)
         self._loading = False
 
         page = self.inner
-        top = tk.Frame(page, bg=C["bg"])
+        top = qt.Frame(page, bg=C["bg"])
         top.pack(fill="x")
         PillButton(top, tr("Back"), app.close_finance, "ghost", icon="back", padx=12, pady=5).pack(side="left")
         PillButton(top, tr("+ Add month"), self.add_month, "primary").pack(side="right", padx=(UI.px(8), 0))
@@ -1262,10 +1268,10 @@ class FinancePage(PageScroll):
         self.stats.pack(fill="x")
         separator(page).pack(fill="x", pady=(UI.px(4), UI.px(12)))
 
-        bar = tk.Frame(page, bg=C["bg"])
+        bar = qt.Frame(page, bg=C["bg"])
         bar.pack(fill="x", pady=(0, UI.px(6)))
         label(bar, tr("Period"), font=UI.small, color=C["muted"]).pack(side="left")
-        self.period_box = ttk.Combobox(bar, textvariable=self.v_period, state="readonly", width=14)
+        self.period_box = qt.Combobox(bar, textvariable=self.v_period, state="readonly", width=14)
         self.period_box.pack(side="left", padx=(UI.px(6), UI.px(14)))
         label(bar, tr("Double-click a month to edit it · a • marks a cell with a comment"), font=UI.small,
               color=C["muted"]).pack(side="left")
@@ -1276,12 +1282,12 @@ class FinancePage(PageScroll):
         for v in (self.v_period, self.v_from, self.v_to):
             v.trace_add("write", lambda *a: None if self._loading else self.show())
         # the first and last month of a custom range, in a row of their own that is only shown for that choice
-        self.range_bar = tk.Frame(page, bg=C["bg"])
+        self.range_bar = qt.Frame(page, bg=C["bg"])
         label(self.range_bar, tr("From"), font=UI.small, color=C["muted"]).pack(side="left")
-        self.from_entry = ttk.Entry(self.range_bar, textvariable=self.v_from, width=10)
+        self.from_entry = qt.Entry(self.range_bar, textvariable=self.v_from, width=10)
         self.from_entry.pack(side="left", padx=(UI.px(6), UI.px(14)))
         label(self.range_bar, tr("To"), font=UI.small, color=C["muted"]).pack(side="left")
-        self.to_entry = ttk.Entry(self.range_bar, textvariable=self.v_to, width=10)
+        self.to_entry = qt.Entry(self.range_bar, textvariable=self.v_to, width=10)
         self.to_entry.pack(side="left", padx=UI.px(6))
         label(self.range_bar, tr("e.g. 2026-01; leave one blank for no limit"), font=UI.small,
               color=C["muted"]).pack(side="left", padx=(UI.px(8), 0))
@@ -1296,16 +1302,16 @@ class FinancePage(PageScroll):
         self.tree.bind("<<TreeviewSelect>>", lambda e: self.show_detail())
         self.signature = self._signature()
 
-        bottom = tk.Frame(page, bg=C["bg"])
+        bottom = qt.Frame(page, bg=C["bg"])
         bottom.pack(fill="x", pady=(UI.px(10), 0))
-        self.totals = tk.Frame(bottom, bg=C["chip"])  # what every category came to over the chosen period
+        self.totals = qt.Frame(bottom, bg=C["chip"])  # what every category came to over the chosen period
         self.totals.pack(side="left", fill="y")
-        side = tk.Frame(bottom, bg=C["chip"])
+        side = qt.Frame(bottom, bg=C["chip"])
         side.pack(side="left", fill="both", expand=True, padx=(UI.px(10), 0))
-        self.detail = tk.Text(side, height=8, wrap="word", font=UI.body, bg=C["chip"], fg=C["text"], relief="flat",
+        self.detail = qt.Text(side, height=8, wrap="word", font=UI.body, bg=C["chip"], fg=C["text"], relief="flat",
                               bd=0, highlightthickness=0, padx=UI.px(12), pady=UI.px(8), cursor="arrow",
                               state="disabled")
-        bar_y = ttk.Scrollbar(side, orient="vertical", command=self.detail.yview, style="Slim.Vertical.TScrollbar")
+        bar_y = qt.Scrollbar(side, orient="vertical", command=self.detail.yview, style="Slim.Vertical.TScrollbar")
 
         def on_scroll(first, last):  # the scroll bar only shows when the text does not fit
             bar_y.set(first, last)
@@ -1403,7 +1409,8 @@ class FinancePage(PageScroll):
         tree.hover_row = ""
         for r in self.shown:
             tree.insert("", "end", iid=r.month.month, values=self._values(
-                r.month.month, r.opening, r.income, r.expenses, r.ending, lambda c: cell_text(r.month.entries.get(c.id))))
+                r.month.month, r.opening, r.income, r.expenses, r.ending,
+                lambda c, row=r: cell_text(row.month.entries.get(c.id))))
         total = summarize(self.shown)
         if self.shown:
             tree.insert("", "end", iid="total", tags=["total"], values=self._values(
@@ -1456,7 +1463,7 @@ class FinancePage(PageScroll):
                 label(panel, c.name, bg=bg).grid(row=3 + i, column=col, sticky="w", padx=(pad, UI.px(16)))
                 label(panel, fmt_money(amount) if amount else "-", color=None if amount else C["muted"], bg=bg).grid(
                     row=3 + i, column=col + 1, sticky="e", padx=(0, pad if col else 0))
-            tk.Frame(panel, height=1, bg=C["border"]).grid(row=3 + longest, column=col, columnspan=2, sticky="we",
+            qt.Frame(panel, height=1, bg=C["border"]).grid(row=3 + longest, column=col, columnspan=2, sticky="we",
                                                            padx=pad, pady=UI.px(4))
             label(panel, tr(grand_title), font=UI.bold, bg=bg).grid(row=4 + longest, column=col, sticky="w",
                                                                     padx=(pad, UI.px(16)), pady=(0, UI.px(8)))
@@ -1554,7 +1561,7 @@ class FinancePage(PageScroll):
 # ======================================================================
 # Sidebar row: symbol, shares, today's sparkline and a price pill
 # ======================================================================
-class StockRow(tk.Frame):
+class StockRow(qt.Frame):
     def __init__(self, parent, symbol: str, on_click):
         super().__init__(parent, bg=C["bg"], cursor="hand2")
         self.symbol = symbol
@@ -1565,7 +1572,7 @@ class StockRow(tk.Frame):
         self.spark = LineChart(self, height=UI.px(34), width=UI.px(70), interactive=False, pad=2, line_width=1.5,
                                dot=2.5, halo=4, fps=15)  # a small chart gets a small dot, and needs fewer frames
         self.spark.grid(row=0, column=1, rowspan=2, padx=UI.px(10))
-        self.pill = tk.Canvas(self, width=UI.px(84), height=UI.px(30), bg=C["bg"], highlightthickness=0, bd=0)
+        self.pill = qt.Canvas(self, width=UI.px(84), height=UI.px(30), bg=C["bg"], highlightthickness=0, bd=0)
         self.pill.grid(row=0, column=2, rowspan=2)
         self.columnconfigure(0, weight=1)
         for w in (self, self.sym_label, self.sub, self.spark, self.pill):
@@ -1679,7 +1686,7 @@ class App:
         ("cash", "Cash Change", 105, "e"), ("balance", "Cash Balance", 110, "e"), ("note", "Note", 160, "w"),
     ]
 
-    def __init__(self, root: tk.Tk, db: Storage, folder: Path):
+    def __init__(self, root: qt.Window, db: Storage, folder: Path):
         self.root = root
         self.db = db
         self.folder = folder
@@ -1704,18 +1711,18 @@ class App:
         self.last_type = "BUY"
         self.range = "1D"
 
-        self.v_show_closed = tk.BooleanVar(value=False)
-        self.v_filter_symbol = tk.StringVar(value=tr(ALL))
-        self.v_filter_type = tk.StringVar(value=tr(ALL))
-        self.v_filter_period = tk.StringVar(value=tr(PERIODS["ALL"]))
-        self.v_from = tk.StringVar()  # the dates of a custom range; blank = no limit on that side
-        self.v_to = tk.StringVar()
+        self.v_show_closed = qt.BooleanVar(value=False)
+        self.v_filter_symbol = qt.StringVar(value=tr(ALL))
+        self.v_filter_type = qt.StringVar(value=tr(ALL))
+        self.v_filter_period = qt.StringVar(value=tr(PERIODS["ALL"]))
+        self.v_from = qt.StringVar()  # the dates of a custom range; blank = no limit on that side
+        self.v_to = qt.StringVar()
         self.period_codes: dict[str, str] = {}  # the period choices as shown -> their codes (see refresh)
-        self.v_live = tk.BooleanVar(value=db.get_setting("live_prices", "1") == "1")
-        self.v_dark = tk.BooleanVar(value=db.get_setting("theme", "dark") == "dark")
-        self.v_finance = tk.BooleanVar(value=db.finance_enabled())  # the optional Finance page (off until turned on)
-        self.v_text_size = tk.StringVar(value=text_size(db))
-        self.v_language = tk.StringVar(value=language())
+        self.v_live = qt.BooleanVar(value=db.get_setting("live_prices", "1") == "1")
+        self.v_dark = qt.BooleanVar(value=db.get_setting("theme", "dark") == "dark")
+        self.v_finance = qt.BooleanVar(value=db.finance_enabled())  # the optional Finance page (off until turned on)
+        self.v_text_size = qt.StringVar(value=text_size(db))
+        self.v_language = qt.StringVar(value=language())
         for v in (self.v_filter_symbol, self.v_filter_type, self.v_filter_period, self.v_from, self.v_to):
             v.trace_add("write", lambda *a: self.refresh_txn_list())
 
@@ -1749,10 +1756,10 @@ class App:
         self._build_topbar()
         self.status = label(self.root, "", font=UI.small, color=C["muted"], anchor="w")
         self.status.pack(side="bottom", fill="x", padx=UI.px(28), pady=(0, UI.px(8)))
-        body = self.body = tk.Frame(self.root, bg=C["bg"])
+        body = self.body = qt.Frame(self.root, bg=C["bg"])
         body.pack(fill="both", expand=True, padx=UI.px(28), pady=(UI.px(18), UI.px(8)))
         self._build_sidebar(body)
-        self.main = tk.Frame(body, bg=C["bg"])  # holds the overview, or a stock's page in its place
+        self.main = qt.Frame(body, bg=C["bg"])  # holds the overview, or a stock's page in its place
         self.main.pack(side="left", fill="both", expand=True)
         self.overview = PageScroll(self.main)
         self.overview.pack(fill="both", expand=True)
@@ -1772,10 +1779,10 @@ class App:
         self._build_tabs(main)
         self.overview.bind_wheel()
 
-    def _build_net_summary(self, main) -> tuple[tk.Frame, "StatGrid"]:
+    def _build_net_summary(self, main) -> tuple[qt.Frame, "StatGrid"]:
         """The block above the chart of the all-accounts view that shows the net worth including the finance cash
         balance, next to its parts. It is packed (above the chart) only while there is something to show."""
-        frame = tk.Frame(main, bg=C["bg"])
+        frame = qt.Frame(main, bg=C["bg"])
         grid = StatGrid(frame, [("total", tr("Net worth (all accounts)")), ("stock", tr("Stock accounts net worth")),
                                 ("cash", tr("Stock accounts cash")), ("finance", tr("Finance cash balance"))])
         grid.pack(fill="x")
@@ -1784,10 +1791,10 @@ class App:
         return frame, grid
 
     def _build_topbar(self):
-        bar = tk.Frame(self.root, bg=C["bg"])
+        bar = qt.Frame(self.root, bg=C["bg"])
         bar.pack(fill="x", padx=UI.px(28), pady=(UI.px(14), UI.px(10)))
         logo(bar, tr(APP_NAME)).pack(side="left")
-        self.stock_left = tk.Frame(bar, bg=C["bg"])  # the stock-only controls, hidden while the finance page is open
+        self.stock_left = qt.Frame(bar, bg=C["bg"])  # the stock-only controls, hidden while the finance page is open
         self.stock_left.pack(side="left")
         self.account_btn = PillButton(self.stock_left, tr("No account"), self._account_menu, "secondary", padx=14, pady=6,
                                       caret=True)
@@ -1798,13 +1805,13 @@ class App:
 
         self.more_btn = PillButton(bar, "", self._more_menu, "ghost", padx=10, pady=6, icon="more")
         self.more_btn.pack(side="right")
-        self.stock_right = tk.Frame(bar, bg=C["bg"])
+        self.stock_right = qt.Frame(bar, bg=C["bg"])
         self.stock_right.pack(side="right")
         PillButton(self.stock_right, tr("+ Add transaction"), self.add_txn, "primary", padx=16, pady=6).pack(
             side="right", padx=(UI.px(8), UI.px(4)))
         PillButton(self.stock_right, tr("Update prices"), self.update_prices, "secondary", padx=14, pady=6).pack(
             side="right")
-        live = tk.Frame(self.stock_right, bg=C["bg"])
+        live = qt.Frame(self.stock_right, bg=C["bg"])
         live.pack(side="right", padx=UI.px(16))
         self.live_status = label(live, "", font=UI.small, color=C["muted"])
         self.live_status.pack(side="left", padx=(0, UI.px(10)))
@@ -1813,11 +1820,11 @@ class App:
         separator(self.root).pack(fill="x")
 
     def _build_sidebar(self, body):
-        side = tk.Frame(body, bg=C["bg"], highlightthickness=1, highlightbackground=C["border"],
+        side = qt.Frame(body, bg=C["bg"], highlightthickness=1, highlightbackground=C["border"],
                         width=UI.px(310))
         side.pack(side="right", fill="y", padx=(UI.px(28), 0))
         side.pack_propagate(False)
-        head = tk.Frame(side, bg=C["bg"])
+        head = qt.Frame(side, bg=C["bg"])
         head.pack(fill="x", padx=UI.px(16), pady=(UI.px(14), UI.px(8)))
         label(head, tr("Stocks"), font=UI.h2).pack(side="left")
         self.side_count = label(head, "", font=UI.small, color=C["muted"])
@@ -1830,20 +1837,20 @@ class App:
 
     def _build_tabs(self, main):
         separator(main).pack(fill="x", pady=(0, UI.px(12)))
-        head = tk.Frame(main, bg=C["bg"])
+        head = qt.Frame(main, bg=C["bg"])
         head.pack(fill="x")
-        self.pages: dict[str, tk.Frame] = {}
+        self.pages: dict[str, qt.Frame] = {}
         self.tabs_head = head
         self.page_tabs: TabBar | None = None
-        tools = tk.Frame(head, bg=C["bg"])
+        tools = qt.Frame(head, bg=C["bg"])
         tools.pack(side="right", fill="x")
-        stack = tk.Frame(main, bg=C["bg"])
+        stack = qt.Frame(main, bg=C["bg"])
         stack.pack(fill="both", expand=True, pady=(UI.px(8), 0))
 
         # --- Accounts (all-accounts view only) ---
-        page = tk.Frame(stack, bg=C["bg"])
+        page = qt.Frame(stack, bg=C["bg"])
         self.pages["Accounts"] = page
-        bar = tk.Frame(page, bg=C["bg"])
+        bar = qt.Frame(page, bg=C["bg"])
         bar.pack(fill="x", pady=(0, UI.px(6)))
         label(bar, tr("Double-click an account to open it"), font=UI.small, color=C["muted"]).pack(side="left")
         frame, self.acct_tree = make_tree(page, columns(self.ACCOUNT_COLUMNS))
@@ -1851,9 +1858,9 @@ class App:
         self.acct_tree.bind("<Double-1>", self._on_account_double)
 
         # --- Holdings ---
-        page = tk.Frame(stack, bg=C["bg"])
+        page = qt.Frame(stack, bg=C["bg"])
         self.pages["Holdings"] = page
-        bar = tk.Frame(page, bg=C["bg"])
+        bar = qt.Frame(page, bg=C["bg"])
         bar.pack(fill="x", pady=(0, UI.px(6)))
         label(bar, tr("Double-click a stock to open its page"), font=UI.small, color=C["muted"]).pack(side="left")
         PillButton(bar, tr("View details"), self.open_selected_symbol, "secondary", font=UI.small_bold,
@@ -1865,19 +1872,19 @@ class App:
         self.hold_tree.bind("<Double-1>", self._on_hold_double)
 
         # --- Transactions ---
-        page = tk.Frame(stack, bg=C["bg"])
+        page = qt.Frame(stack, bg=C["bg"])
         self.pages["Transactions"] = page
-        bar = tk.Frame(page, bg=C["bg"])
+        bar = qt.Frame(page, bg=C["bg"])
         bar.pack(fill="x", pady=(0, UI.px(6)))
         label(bar, tr("Symbol"), font=UI.small, color=C["muted"]).pack(side="left")
-        self.filter_symbol_box = ttk.Combobox(bar, textvariable=self.v_filter_symbol, state="readonly", width=10)
+        self.filter_symbol_box = qt.Combobox(bar, textvariable=self.v_filter_symbol, state="readonly", width=10)
         self.filter_symbol_box.pack(side="left", padx=(UI.px(6), UI.px(14)))
         label(bar, tr("Type"), font=UI.small, color=C["muted"]).pack(side="left")
-        self.filter_type_box = ttk.Combobox(bar, textvariable=self.v_filter_type, state="readonly", width=12,
+        self.filter_type_box = qt.Combobox(bar, textvariable=self.v_filter_type, state="readonly", width=12,
                                             values=[tr(ALL), *(tr(text) for text in TXN_TYPES.values())])
         self.filter_type_box.pack(side="left", padx=(UI.px(6), UI.px(14)))
         label(bar, tr("Period"), font=UI.small, color=C["muted"]).pack(side="left")
-        self.filter_period_box = ttk.Combobox(bar, textvariable=self.v_filter_period, state="readonly", width=14)
+        self.filter_period_box = qt.Combobox(bar, textvariable=self.v_filter_period, state="readonly", width=14)
         self.filter_period_box.pack(side="left", padx=UI.px(6))
         # only shown while a filter is on; it resets the filters and deletes nothing
         self.reset_btn = PillButton(bar, tr("Reset filters"), self._clear_filters, "ghost", font=UI.small_bold,
@@ -1889,12 +1896,12 @@ class App:
         self.txn_count = label(bar, "", font=UI.small, color=C["muted"])
         self.txn_count.pack(side="right", padx=UI.px(12))
         # the two dates of a custom range, in a row of their own that is only shown for that choice
-        self.range_bar = tk.Frame(page, bg=C["bg"])
+        self.range_bar = qt.Frame(page, bg=C["bg"])
         label(self.range_bar, tr("From"), font=UI.small, color=C["muted"]).pack(side="left")
-        self.from_entry = ttk.Entry(self.range_bar, textvariable=self.v_from, width=12)
+        self.from_entry = qt.Entry(self.range_bar, textvariable=self.v_from, width=12)
         self.from_entry.pack(side="left", padx=(UI.px(6), UI.px(14)))
         label(self.range_bar, tr("To"), font=UI.small, color=C["muted"]).pack(side="left")
-        self.to_entry = ttk.Entry(self.range_bar, textvariable=self.v_to, width=12)
+        self.to_entry = qt.Entry(self.range_bar, textvariable=self.v_to, width=12)
         self.to_entry.pack(side="left", padx=UI.px(6))
         label(self.range_bar, tr("e.g. 2026-09-30; leave one blank for no limit"), font=UI.small,
               color=C["muted"]).pack(side="left", padx=(UI.px(8), 0))
@@ -1926,12 +1933,12 @@ class App:
                 page.pack_forget()
         self.overview.refit()
 
-    def _popup(self, menu: tk.Menu, widget: tk.Widget):
-        menu.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height() + UI.px(4))
+    def _popup(self, menu: qt.Menu, widget: qt.Widget):
+        menu.popup_at(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height() + UI.px(4))
 
     def _account_menu(self):
-        m = style_menu(tk.Menu(self.root, tearoff=False))
-        current = tk.IntVar(value=self.account_id or 0)
+        m = style_menu(qt.Menu(self.root, tearoff=False))
+        current = qt.IntVar(value=self.account_id or 0)
         if len(self.accounts) >= 2:
             m.add_radiobutton(label=tr("All accounts"), variable=current, value=ALL_ACCOUNTS,
                               command=lambda: self._select_account(ALL_ACCOUNTS))
@@ -1948,7 +1955,7 @@ class App:
         self._popup(m, self.account_btn)
 
     def _more_menu(self):
-        m = style_menu(tk.Menu(self.root, tearoff=False))
+        m = style_menu(qt.Menu(self.root, tearoff=False))
         stock = "disabled" if self.finance else "normal"  # these act on the stock accounts
         m.add_command(label=tr("Add transaction"), accelerator="Ctrl+N", command=self.add_txn, state=stock)
         m.add_command(label=tr("Update prices…"), command=self.update_prices, state=stock)
@@ -1961,11 +1968,11 @@ class App:
         m.add_command(label=tr("Open data folder"), command=lambda: open_folder(self.folder))
         m.add_separator()
         m.add_checkbutton(label=tr("Dark mode"), variable=self.v_dark, command=self.toggle_theme)
-        sizes = style_menu(tk.Menu(m, tearoff=False))
+        sizes = style_menu(qt.Menu(m, tearoff=False))
         for name in TEXT_SIZES:
             sizes.add_radiobutton(label=tr(name), value=name, variable=self.v_text_size, command=self.change_text_size)
         m.add_cascade(label=tr("Text size"), menu=sizes)
-        langs = style_menu(tk.Menu(m, tearoff=False))
+        langs = style_menu(qt.Menu(m, tearoff=False))
         for code, name in LANGUAGES.items():
             langs.add_radiobutton(label=name, value=code, variable=self.v_language, command=self.change_language)
         m.add_cascade(label="Language / 语言", menu=langs)  # in both languages, so it can always be found
@@ -2029,6 +2036,8 @@ class App:
     def _select_account(self, account_id):
         if account_id != self.account_id:
             self.v_filter_symbol.set(tr(ALL))
+            self.hero.value.reset()
+            self.hero._scrub_index = None
             self.close_detail()
         self.account_id = account_id
         acc = self.current_account()
@@ -2326,7 +2335,7 @@ class App:
                 done, res = self._bg_queue.get_nowait()
                 try:
                     done(res)
-                except tk.TclError:
+                except qt.WidgetError:
                     pass  # the window it was meant for was closed meanwhile
         except queue.Empty:
             pass
@@ -2809,11 +2818,11 @@ def main():
     db = Storage(db_path)
     set_language(saved_language(db))
     set_theme(db.get_setting("theme", "dark"))
-    root = tk.Tk()
+    root = qt.Window()
     if sys.platform == "win32":
         try:
             root.iconbitmap(default=str(resource_path("icon.ico")))
-        except tk.TclError:
+        except qt.WidgetError:
             pass
     UI.setup(root, TEXT_SIZES[text_size(db)], cjk=language() == "zh")
     App(root, db, folder)

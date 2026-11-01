@@ -8,15 +8,15 @@ set "PY="
 where py >nul 2>nul && set "PY=py -3"
 if not defined PY where python >nul 2>nul && set "PY=python"
 if not defined PY goto :nopython
-%PY% -c "import tkinter" >nul 2>nul || goto :nopython
+%PY% -c "import sys" >nul 2>nul || goto :nopython
 
 rem --- separate virtual environment just for building ---
 if not exist ".venv-win\Scripts\python.exe" (
     echo Creating virtual environment .venv-win ...
     %PY% -m venv .venv-win || goto :fail
 )
-echo Installing PyInstaller ...
-".venv-win\Scripts\python.exe" -m pip install --upgrade --quiet pip pyinstaller || goto :fail
+echo Installing PyInstaller and PyQt6 ...
+".venv-win\Scripts\python.exe" -m pip install --upgrade --quiet pip pyinstaller -r requirements.txt || goto :fail
 
 rem --- build as a folder (--onedir): starts faster than a single-file exe, which has to unpack
 rem     itself to %TEMP% on every launch, and is flagged by antivirus far less often ---
@@ -36,7 +36,7 @@ echo Copy the whole StockLedger folder wherever you like; run StockLedger.exe in
 goto :end
 
 :nopython
-echo [ERROR] Windows Python with tkinter was not found.
+echo [ERROR] Windows Python was not found.
 echo         Install Python from https://www.python.org/downloads/windows/
 echo         and tick "Add python.exe to PATH" in the installer.
 goto :end
