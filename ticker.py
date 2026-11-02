@@ -107,6 +107,8 @@ class CharacterTrack(QObject):
         self.parent_widget.update()
 
     def clear_color(self):
+        if self.color_anim.state() == QVariantAnimation.State.Stopped and self.current_color == self.base_white:
+            return
         self.color_anim.stop()
         self.current_color = QColor(self.base_white)
         self.parent_widget.update()
@@ -167,10 +169,17 @@ class CharacterTrack(QObject):
             else:
                 end += 10
         self.target_offset = end
+        # Reset the clock before publishing the new endpoints. Otherwise Qt
+        # recalculates them at the previous animation time and emits transient
+        # offsets (and redundant updates) while the reel is being retargeted.
+        blocked = self.scroll_anim.blockSignals(True)
         self.scroll_anim.stop()
         self.scroll_anim.setDuration(duration)
         self.scroll_anim.setStartValue(start)
         self.scroll_anim.setEndValue(end)
+        self.scroll_anim.setCurrentTime(0)
+        self.current_offset = start
+        self.scroll_anim.blockSignals(blocked)
         self.scroll_anim.start()
         if flash_color is not None:
             self.flash(flash_color)
@@ -334,6 +343,8 @@ class RobinhoodAdvancedTicker(QWidget):
 
     def set_text(self, text, *, flash=True, animate=True):
         text = str(text)
+        if animate and self.track_dict and text == self.old_str and (not flash) == self._scrubbing:
+            return
         slots = self._text_to_slots(text)
         price = self._price(text) if slots is not None else None
         old_price, old_text = self.current_price, self.old_str
@@ -400,8 +411,10 @@ class RobinhoodAdvancedTicker(QWidget):
                     track.clear_color()
         finally:
             self._batching = False
+        # Retargeting preserves the painted position. The animation clock (or
+        # an actual color/static-slot change) schedules the next repaint, so
+        # high-rate pointer input does not add identical frames between ticks.
         self.update_geometry_size()
-        self.update()
 
     def settle(self):
         for key, track in list(self.track_dict.items()):

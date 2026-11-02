@@ -9,10 +9,13 @@ means rebuilding the window (App.rebuild does that).
 
 from __future__ import annotations
 
+import math
 import re
 import time
+
+from PyQt6.QtGui import QColor, QFont, QPainter, QPixmap
+
 import qt_widgets as qt
-from PyQt6.QtGui import QFont
 
 # Gain/loss colors follow the US convention (green = up, red = down).
 # Set to True for the Chinese-market convention (red = up, green = down).
@@ -341,6 +344,7 @@ class LineChart(qt.Canvas):
         kw = {"width": width} if width else {}
         super().__init__(parent, height=height, bg=bg or C["bg"], highlightthickness=0, bd=0, **kw)
         self.on_hover = on_hover
+        self._interactive = interactive
         self.pad = UI.px(pad)
         self.line_width = UI.px(line_width) or 1
         self.dot_radius = UI.px(dot)
@@ -356,6 +360,11 @@ class LineChart(qt.Canvas):
         self._pulse_at: tuple[float, float] | None = None  # where the latest point is drawn
         self._pulse_job = None
         self._hovering = False
+        self._hover_index = None
+        self._hover_items = None
+        self._plot_xy = None
+        self._plot_cache = None
+        self._plot_cache_key = None
         self.bind("<Configure>", lambda e: self.redraw())
         self.bind("<Destroy>", lambda e: self._stop_pulse() if e.widget is self else None, add="+")
         if interactive:
@@ -391,12 +400,17 @@ class LineChart(qt.Canvas):
 
     def redraw(self):
         self.delete("all")
+        self._hover_index = None
+        self._hover_items = None
+        self._plot_xy = None
+        self._plot_cache = None
         if len(self.values) < 2:
             if self.message:
                 self.create_text(self.winfo_width() / 2, self.winfo_height() / 2, text=self.message,
                                  fill=C["muted"], font=UI.body)
             return
         x, y = self._xy()
+        self._plot_xy = x, y
         self._pulse_at = None
         if self.pulse:  # the halo goes under everything else, so the line stays crisp on top of it
             self._pulse_at = (x(len(self.values) - 1), y(self.values[-1]))
@@ -413,6 +427,32 @@ class LineChart(qt.Canvas):
             self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=self.color, outline="", tags="dot")
             if self._hovering:
                 self.itemconfigure("dot", state="hidden")
+
+    def paintEvent(self, event):
+        if not self._interactive or len(self.values) < 2:
+            return super().paintEvent(event)
+        # Warm the static backing on the first paint, before scrubbing starts.
+        # Keep the live halo's original layering while the pointer is outside.
+        ratio = self.devicePixelRatioF()
+        key = (self.width(), self.height(), ratio, self.cget("background"))
+        if self._plot_cache is None or self._plot_cache_key != key:
+            cache = QPixmap(math.ceil(self.width() * ratio), math.ceil(self.height() * ratio))
+            cache.setDevicePixelRatio(ratio)
+            cache.fill(QColor(key[3]))
+            painter = QPainter(cache)
+            self._paint_shapes(painter, (shape for shape in self._shapes.values()
+                                        if not {"hover", "halo", "dot"}.intersection(self._shape_tags(shape[2]))))
+            painter.end()
+            self._plot_cache = cache
+            self._plot_cache_key = key
+        if self.pulse and not self._hovering:
+            return super().paintEvent(event)
+        qt.Frame.paintEvent(self, event)
+        painter = QPainter(self)
+        painter.drawPixmap(0, 0, self._plot_cache)
+        self._paint_shapes(painter, (shape for shape in self._shapes.values()
+                                    if "hover" in self._shape_tags(shape[2])))
+        painter.end()
 
     # ---- the live dot's pulse
     def _mix(self, a: str, b: str, t: float) -> str:
@@ -451,30 +491,44 @@ class LineChart(qt.Canvas):
             self._pulse_job = None
 
     def _motion(self, event):
-        self.delete("hover")
         if len(self.values) < 2:
             return
-        self._hovering = True  # the crosshair's own dot takes over from the live dot
-        self.itemconfigure("halo", state="hidden")
-        self.itemconfigure("dot", state="hidden")
-        x, y = self._xy()
         n = max(len(self.values), self.slots, 2)
         step = (self.winfo_width() - 2 * self.pad) / (n - 1)
         i = min(max(round((event.x - self.pad) / step), 0), len(self.values) - 1)
+        if self._hovering and i == self._hover_index:
+            return
+        self._hover_index = i
+        self._hovering = True  # the crosshair's own dot takes over from the live dot
+        self.itemconfigure("halo", state="hidden")
+        self.itemconfigure("dot", state="hidden")
+        # Data/size changes rebuild these transforms in redraw(); pointer motion
+        # only moves the existing overlay, without rescanning the price history.
+        x, y = self._plot_xy
         xi, yi = x(i), y(self.values[i])
-        self.create_line(xi, self.pad + UI.px(14), xi, self.winfo_height() - self.pad, fill=C["muted"], width=1,
-                         tags="hover")
+        if self._hover_items is None:
+            self._hover_items = (
+                self.create_line(0, 0, 0, 0, fill=C["muted"], width=1, tags="hover"),
+                self.create_oval(0, 0, 0, 0, fill=self.color, outline=C["bg"], width=2, tags="hover"),
+                self.create_text(0, 0, text="", fill=C["muted"], font=UI.small, anchor="n", tags="hover"),
+            )
+        line, dot, label = self._hover_items
+        self.coords(line, xi, self.pad + UI.px(14), xi, self.winfo_height() - self.pad)
         r = UI.px(5)
-        self.create_oval(xi - r, yi - r, xi + r, yi + r, fill=self.color, outline=C["bg"], width=2, tags="hover")
+        self.coords(dot, xi - r, yi - r, xi + r, yi + r)
         if i < len(self.labels):
             tx = min(max(xi, UI.px(60)), self.winfo_width() - UI.px(60))
-            self.create_text(tx, self.pad, text=self.labels[i], fill=C["muted"], font=UI.small, anchor="n",
-                             tags="hover")
+            self.coords(label, tx, self.pad)
+            self.itemconfigure(label, text=self.labels[i], state="normal")
+        else:
+            self.itemconfigure(label, state="hidden")
         if self.on_hover:
             self.on_hover(i)
 
     def _leave(self, event):
         self.delete("hover")
+        self._hover_index = None
+        self._hover_items = None
         self._hovering = False
         self.itemconfigure("dot", state="normal")
         if self.on_hover:

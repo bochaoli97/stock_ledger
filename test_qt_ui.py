@@ -8,6 +8,7 @@ import sys
 import time
 import unittest
 from decimal import Decimal as D
+from types import SimpleNamespace
 from unittest import mock
 
 from PyQt6.QtCore import QAbstractAnimation, QEvent, QEasingCurve, QPoint, QRectF, Qt, QTimer
@@ -350,6 +351,39 @@ class DigitTests(unittest.TestCase):
         self.assertTrue(all(track.current_color == QColor("white")
                             and track.color_anim.state() != RUNNING for track in self.digits()))
 
+    def test_retargeting_emits_no_intermediate_offsets_from_the_previous_clock(self):
+        for target in ("224.00", "126.00"):
+            with self.subTest(target=target):
+                self.ticker.set_text("$123.99", animate=False)
+                self.ticker.set_price(D("124.00"), flash=False)
+                ones = self.ticker.track_dict["int_0"]
+                ones.scroll_anim.setCurrentTime(500)
+                position = ones.current_offset % 10
+                offsets = []
+                ones.scroll_anim.valueChanged.connect(offsets.append)
+                self.ticker.set_price(D(target), flash=False)
+                ones.scroll_anim.valueChanged.disconnect(offsets.append)
+                self.assertEqual(ones.scroll_anim.duration(), 450)
+                self.assertAlmostEqual(ones.current_offset % 10, position)
+                self.assertLessEqual(len(offsets), 1)
+                for offset in offsets:
+                    self.assertAlmostEqual(offset % 10, position)
+                ones.scroll_anim.setCurrentTime(100)
+                self.assertNotAlmostEqual(ones.current_offset % 10, position)
+
+    def test_scrubbing_repaints_on_animation_ticks_instead_of_each_target(self):
+        self.ticker.setStyleSheet("background: #000000;")
+        self.ticker.set_price(D("54.67"))
+        digit = self.ticker.track_dict["dec_2"]
+        before = self.ticker.grab().toImage()
+        with mock.patch.object(self.ticker, "update", wraps=self.ticker.update) as update:
+            self.ticker.set_price(D("54.60"), flash=False)
+            update.assert_not_called()
+            self.assertEqual(self.ticker.grab().toImage(), before)
+            digit.scroll_anim.setCurrentTime(16)
+            update.assert_called()
+            self.assertNotEqual(self.ticker.grab().toImage(), before)
+
     def test_decimal_only_ticks_do_not_restart_an_existing_heavy_integer_roll(self):
         self.ticker.set_price(D("123.99"))
         self.ticker.set_price(D("124.00"))
@@ -541,6 +575,118 @@ class DigitTests(unittest.TestCase):
         container.deleteLater()
 
 
+class ChartRenderingTests(unittest.TestCase):
+    def setUp(self):
+        self.root = qt.Window()
+        app.set_theme("light")
+        app.UI.setup(self.root)
+        self.hover = mock.Mock()
+        self.chart = app.LineChart(self.root, height=220, on_hover=self.hover)
+        self.chart.pack(fill="x")
+        self.root.resize(900, 300)
+        self.root.show()
+        self.chart.set_data([10, 12, 11, 14], baseline=11, labels=["A", "B", "C", "D"])
+        for _ in range(3):
+            qt.application().processEvents()
+
+    def tearDown(self):
+        self.root.destroy()
+        qt.application().processEvents()
+
+    def motion(self, index):
+        chart = self.chart
+        step = (chart.width() - 2 * chart.pad) / (max(len(chart.values), chart.slots, 2) - 1)
+        chart._motion(SimpleNamespace(x=chart.pad + index * step, y=100))
+
+    def assert_original_pixels(self):
+        cached = self.chart.grab().toImage()
+        with mock.patch.object(app.LineChart, "paintEvent", qt.Canvas.paintEvent):
+            original = self.chart.grab().toImage()
+        self.assertEqual(cached, original, "caching must preserve the original chart's pixels")
+
+    def test_repeated_pointer_samples_skip_work_and_new_points_reuse_the_overlay(self):
+        self.motion(1)
+        overlay = self.chart.find_withtag("hover")
+        backing = self.chart._plot_cache.cacheKey()
+        with mock.patch.object(self.chart, "_xy", side_effect=AssertionError("rescanned history")), \
+                mock.patch.object(self.chart, "update", wraps=self.chart.update) as update:
+            for _ in range(100):
+                self.motion(1)
+            update.assert_not_called()
+            self.hover.assert_called_once_with(1)
+            self.motion(2)
+        self.assertEqual(self.chart.find_withtag("hover"), overlay)
+        self.assertEqual(self.hover.call_args_list, [mock.call(1), mock.call(2)])
+        painted = []
+        draw_shapes = self.chart._paint_shapes
+
+        def record_shapes(painter, shapes):
+            shapes = list(shapes)
+            painted.extend(shapes)
+            draw_shapes(painter, shapes)
+
+        with mock.patch.object(self.chart, "_paint_shapes", side_effect=record_shapes):
+            self.chart.grab()
+        self.assertTrue(painted)
+        self.assertTrue(all("hover" in self.chart._shape_tags(shape[2]) for shape in painted))
+        self.assertEqual(self.chart._plot_cache.cacheKey(), backing)
+        self.chart._leave(None)
+        self.hover.assert_called_with(None)
+        self.motion(2)
+        self.assertEqual(self.hover.call_args_list[-2:], [mock.call(None), mock.call(2)])
+
+    def test_backing_matches_original_pixels_in_both_themes_and_hover_states(self):
+        for theme in ("light", "dark"):
+            app.set_theme(theme)
+            self.chart.configure(bg=app.C["bg"])
+            for pulse in (False, True):
+                with self.subTest(theme=theme, pulse=pulse):
+                    self.chart.set_data([10, 12, 11, 14], baseline=11, labels=["A", "B", "C", "D"],
+                                        color=app.C["gain"], pulse=pulse)
+                    self.chart._stop_pulse()
+                    self.chart._leave(None)
+                    self.assert_original_pixels()
+                    for index in (0, 1, 3):
+                        self.motion(index)
+                        self.assert_original_pixels()
+                    self.chart._leave(None)
+                    self.assert_original_pixels()
+
+    def test_data_resize_background_and_missing_labels_refresh_the_backing(self):
+        self.motion(1)
+        self.chart.grab()
+        backing = self.chart._plot_cache.cacheKey()
+        self.chart.set_data([30, 15, 45, 20], baseline=25, labels=["New"])
+        self.motion(1)
+        self.hover.assert_called_with(1)
+        self.assert_original_pixels()
+        self.assertNotEqual(self.chart._plot_cache.cacheKey(), backing)
+        self.assertEqual(self.chart.itemcget(self.chart._hover_items[2], "state"), "hidden")
+        self.root.resize(700, 300)
+        qt.application().processEvents()
+        self.motion(0)
+        self.assert_original_pixels()
+        self.chart.configure(bg="#E0E0E0")
+        self.assert_original_pixels()
+        self.chart.set_data([], message="Loading…")
+        self.assert_original_pixels()
+
+    def test_cached_pixels_match_for_flat_negative_and_partially_filled_charts(self):
+        for theme in ("light", "dark"):
+            app.set_theme(theme)
+            self.chart.configure(bg=app.C["bg"])
+            for values, baseline, slots in (([3, 3, 3], 3, 0), ([-2, -1, -4], 0, 0),
+                                            ([0, .01, -.01], None, 0), ([6, 8, 7], 7, 79)):
+                with self.subTest(theme=theme, values=values, baseline=baseline, slots=slots):
+                    self.chart.set_data(values, baseline=baseline, slots=slots, color=app.C["loss"],
+                                        labels=["A", "B", "C"])
+                    self.chart._leave(None)
+                    self.assert_original_pixels()
+                    for index in (0, 2):
+                        self.motion(index)
+                        self.assert_original_pixels()
+
+
 class AppTests(unittest.TestCase):
     def setUp(self):
         self.root, self.app = _gui_window()
@@ -648,6 +794,50 @@ class AppTests(unittest.TestCase):
         self.assertEqual(hero.value.old_str, "$12.00")
         self.assertTrue(any(d.scroll_anim.duration() in (260, 320, 450, 650) and d.current_color == QColor("#00C805") for d in hero.value.track_dict.values() if d.is_digit))
 
+    def test_quote_replaces_the_hovered_point_even_when_its_index_is_unchanged(self):
+        self.apply("11")
+        self.app.open_symbol("SKYD")
+        self.root.process_events()
+        hero = self.app.detail.hero
+        move_mouse(hero.chart, QPoint(hero.chart.pad, hero.chart.height() // 2))
+        self.assertEqual(hero._scrub_index, 0)
+        self.assertEqual(hero.value.old_str, "$10.00")
+        hero.chart.grab()
+        backing = hero.chart._plot_cache.cacheKey()
+        quotes = {"SKYD": Quote(price=D(12), prev_close=D(10), time=None,
+                                points=[(1800000000, 10.25), (1800000300, 10.75)]),
+                  "AAPL": self.quote("155")}
+        self.app._apply_quotes(list(quotes), quotes)
+        self.assertEqual(hero._scrub_index, 0)
+        self.assertEqual(hero.value.old_str, "$10.25")
+        self.assertIn("0.25", hero.change.cget("text"))
+        self.assertTrue(hero.value._scrubbing)
+        hero.chart.grab()
+        self.assertNotEqual(hero.chart._plot_cache.cacheKey(), backing)
+        with mock.patch.object(hero.chart, "on_hover", wraps=hero._hover) as hover:
+            move_mouse(hero.chart, QPoint(hero.chart.pad, hero.chart.height() // 2 + 1))
+            hover.assert_called_once_with(0)
+        qt.application().sendEvent(hero.chart, QEvent(QEvent.Type.Leave))
+        self.assertIsNone(hero._scrub_index)
+        self.assertEqual(hero.value.old_str, "$12.00")
+        self.assertFalse(hero.value._scrubbing)
+
+    def test_restoring_the_same_displayed_price_leaves_scrub_mode(self):
+        self.apply("10")
+        self.app.open_symbol("SKYD")
+        self.root.process_events()
+        hero = self.app.detail.hero
+        hero._hover(0)
+        self.assertEqual(hero.value.old_str, "$10.00")
+        self.assertTrue(hero.value._scrubbing)
+        hero._hover(None)
+        self.assertEqual(hero.value.old_str, "$10.00")
+        self.assertFalse(hero.value._scrubbing)
+        self.assertEqual(hero.period.cget("text"), hero.now[3])
+        self.apply("10.01")
+        self.assertEqual(hero.value.old_str, "$10.01")
+        self.assertEqual(hero.value.track_dict["dec_2"].current_color, QColor("#00C805"))
+
     def test_native_chart_pointer_and_keyboard_shortcuts(self):
         self.apply("11")
         self.app.open_symbol("SKYD")
@@ -665,6 +855,22 @@ class AppTests(unittest.TestCase):
             add.assert_called_once()
             QTest.keyClick(self.app.hold_tree, Qt.Key.Key_F5)
             refresh.assert_called_once()
+
+    def test_scrubbing_only_updates_changed_headline_label_properties(self):
+        hero = self.app.hero
+        hero.show("1W", "$12.00", [(1800000000, 10, 0), (1800000300, 11, 0), (1800000600, 12, 0)],
+                  baseline=9)
+        hero._hover(0)
+        with mock.patch.object(hero.change, "setStyleSheet", wraps=hero.change.setStyleSheet) as style, \
+                mock.patch.object(hero.period, "configure", wraps=hero.period.configure) as period:
+            hero._hover(1)
+            self.assertEqual(hero.value.old_str, "$11.00")
+            self.assertIn("2.00", hero.change.cget("text"))
+            style.assert_not_called()
+            period.assert_not_called()
+            with mock.patch.object(hero.change, "configure", wraps=hero.change.configure) as change:
+                hero._hover(1)
+                change.assert_not_called()
 
     def test_native_chart_scrubbing_uses_heavy_gears_in_all_three_headlines(self):
         a = self.app
