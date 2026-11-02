@@ -791,8 +791,14 @@ class Hero(qt.Frame):
             ch, base = self._change(i)
             value, change, color, period = usd(self.points[i][1]), change_text(ch, base), color_for(ch), ""
         self.value.set_text(value, flash=i is None)
-        self.change.configure(text=change, fg=color)
-        self.period.configure(text=period)
+        # Reapplying the same color stylesheet invalidates the surrounding Qt
+        # layouts on every pointer event, even when only the price changed.
+        change_options = {key: value for key, value in (("text", change), ("fg", color))
+                          if self.change.cget(key) != value}
+        if change_options:
+            self.change.configure(**change_options)
+        if self.period.cget("text") != period:
+            self.period.configure(text=period)
 
 
 # ======================================================================

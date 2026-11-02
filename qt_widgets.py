@@ -1258,9 +1258,14 @@ class Canvas(Frame):
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
+        self._paint_shapes(painter, self._shapes.values())
+        painter.end()
+
+    def _paint_shapes(self, painter, shapes):
+        """Draw retained shapes into either the widget or a chart's backing pixmap."""
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        for kind, points, opts in self._shapes.values():
+        for kind, points, opts in shapes:
             if opts.get("state") == "hidden":
                 continue
             fill = opts.get("fill", "")
@@ -1300,7 +1305,6 @@ class Canvas(Frame):
                 rect.moveLeft(x if "w" in anchor else x - rect.width() if "e" in anchor else x - rect.width() / 2)
                 rect.moveTop(y if "n" in anchor else y - rect.height() if "s" in anchor else y - rect.height() / 2)
                 painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
-        painter.end()
 
 
 class Menu(WidgetMixin, QMenu):
