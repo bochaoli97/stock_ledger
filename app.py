@@ -2380,9 +2380,18 @@ class App:
         if isinstance(got, Exception):
             self.live_status.configure(text=tr("Offline, retrying…"), fg=C["loss"])
             return
-        self.quotes.update(got)
+        # A later response can contain an older snapshot. Validate each symbol
+        # before replacing either its quote/chart data or its persisted price.
+        accepted = {}
+        for symbol, quote in got.items():
+            previous = self.quotes.get(symbol)
+            if (previous is not None and previous.time is not None
+                    and (quote.time is None or quote.time.timestamp() < previous.time.timestamp())):
+                continue
+            accepted[symbol] = quote
+        self.quotes.update(accepted)
         # save prices that changed, so the last known price is still there when offline
-        changed = {s: q.price for s, q in got.items() if self.prices.get(s) != q.price}
+        changed = {s: q.price for s, q in accepted.items() if self.prices.get(s) != q.price}
         if changed:
             self.db.set_prices(changed)
             self.price_info.update({s: (price, today()) for s, price in changed.items()})
