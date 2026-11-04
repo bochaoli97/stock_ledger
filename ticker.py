@@ -7,11 +7,13 @@ import math
 import re
 from decimal import Decimal, InvalidOperation
 
-from PyQt6.QtCore import QObject, QEasingCurve, QRectF, QSize, Qt, QVariantAnimation
+from PyQt6.QtCore import QEasingCurve, QObject, QRectF, QSize, Qt, QVariantAnimation
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter
 from PyQt6.QtWidgets import QSizePolicy, QWidget
 
 from qt_widgets import WidgetMixin
+
+_DIGITS = tuple("0123456789")
 
 
 def get_slot_rank(key: str) -> float:
@@ -38,6 +40,7 @@ class CharacterTrack(QObject):
     def __init__(self, key, char, font, base_color, parent_widget):
         super().__init__(parent_widget)
         self._key = key
+        self.rank = get_slot_rank(key)
         self._is_digit = key.startswith(("int_", "dec_"))
         self._validate_char(char)
         self.char = self.target_char = char
@@ -57,6 +60,7 @@ class CharacterTrack(QObject):
         self.target_offset = self.current_offset
         self.width_factor = self.opacity = 1.0
         self.is_marked_for_removal = False
+        self.paint_bounds = None
 
         self.scroll_anim = QVariantAnimation(self)
         self.scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -87,12 +91,12 @@ class CharacterTrack(QObject):
 
     def _on_scroll(self, value):
         self.current_offset = float(value)
-        self.parent_widget.update()
+        self.parent_widget.update_track(self)
 
     def _on_scroll_finished(self):
         self.char = self.target_char
         self.current_offset = self.target_offset = float(self.target_char)
-        self.parent_widget.update()
+        self.parent_widget.update_track(self)
 
     def _on_appear(self, value):
         self.width_factor = self.opacity = float(value)
@@ -104,14 +108,14 @@ class CharacterTrack(QObject):
 
     def _on_color(self, value):
         self.current_color = QColor(value)
-        self.parent_widget.update()
+        self.parent_widget.update_track(self)
 
     def clear_color(self):
         if self.color_anim.state() == QVariantAnimation.State.Stopped and self.current_color == self.base_white:
             return
         self.color_anim.stop()
         self.current_color = QColor(self.base_white)
-        self.parent_widget.update()
+        self.parent_widget.update_track(self)
 
     def flash(self, color):
         self.color_anim.stop()
@@ -119,7 +123,7 @@ class CharacterTrack(QObject):
         self.color_anim.setStartValue(QColor(color))
         self.color_anim.setEndValue(self.base_white)
         self.color_anim.start()
-        self.parent_widget.update()
+        self.parent_widget.update_track(self)
 
     def expand_in(self, duration=350):
         self.is_marked_for_removal = False
@@ -159,7 +163,7 @@ class CharacterTrack(QObject):
         self.target_char = new_char
         if not self.is_digit:
             self.char = new_char
-            self.parent_widget.update()
+            self.parent_widget.update_track(self)
             return
         start = self.current_offset % 10
         end = float(new_char)
@@ -220,6 +224,9 @@ class RobinhoodAdvancedTicker(QWidget):
         self.current_price = None
         self.old_str = ""
         self.track_dict = {}
+        self._ordered_cache = None
+        self._layout_cache = None
+        self._size_hint = None
         self._target_slots = {}
         self._batching = False
         self._scrubbing = False
@@ -296,21 +303,42 @@ class RobinhoodAdvancedTicker(QWidget):
         return max(changed, key=get_slot_rank, default=None)
 
     def ordered_tracks(self):
-        return sorted(self.track_dict.values(), key=lambda track: get_slot_rank(track.key), reverse=True)
+        return list(self._ordered_tracks())
+
+    def _ordered_tracks(self):
+        if self._ordered_cache is None:
+            self._ordered_cache = tuple(sorted(self.track_dict.values(), key=lambda track: track.rank, reverse=True))
+        return self._ordered_cache
+
+    def _invalidate_tracks(self):
+        self._ordered_cache = self._layout_cache = None
+
+    def _layout_tracks(self):
+        if self._layout_cache is None:
+            layout = []
+            x = 0.0
+            for track in self._ordered_tracks():
+                width = track.base_width * track.width_factor
+                rect = QRectF(x, 0, width, self.char_height)
+                track.paint_bounds = rect.toAlignedRect()
+                layout.append((track, rect))
+                x += width
+            self._layout_cache = tuple(layout)
+            # Match the original summation order, including fractional widths.
+            width = sum(track.base_width * track.width_factor for track in self.track_dict.values())
+            self._size_hint = QSize(max(self.MIN_WIDTH, math.ceil(width) + self.RIGHT_PADDING), self.char_height)
+        return self._layout_cache
 
     def track_rect(self, key):
-        x = 0.0
-        for track in self.ordered_tracks():
-            width = track.base_width * track.width_factor
+        for track, rect in self._layout_tracks():
             if track.key == key:
-                return QRectF(x, 0, width, self.char_height)
-            x += width
+                return QRectF(rect)
         return QRectF()
 
     def sizeHint(self):
-        width = sum(track.base_width * track.width_factor for track in self.track_dict.values())
         # Retain the previous headline's line height; other page rows do not move.
-        return QSize(max(self.MIN_WIDTH, math.ceil(width) + self.RIGHT_PADDING), self.char_height)
+        self._layout_tracks()
+        return QSize(self._size_hint)
 
     def minimumSizeHint(self):
         return self.sizeHint()
@@ -322,14 +350,24 @@ class RobinhoodAdvancedTicker(QWidget):
             self.updateGeometry()
 
     def on_track_resized(self):
+        self._layout_cache = None
         if not self._batching:
             self.update_geometry_size()
             self.update()
+
+    def update_track(self, track):
+        # Width changes move neighboring columns; those still repaint in full.
+        # With a stable layout, Qt can merge just the changed columns instead.
+        if self._batching or self._layout_cache is None or track.paint_bounds is None:
+            self.update()
+        else:
+            self.update(track.paint_bounds)
 
     def remove_collapsed_track(self, track):
         if (self.track_dict.get(track.key) is track and track.is_marked_for_removal
                 and track.width_factor <= 0.001):
             del self.track_dict[track.key]
+            self._invalidate_tracks()
             track.stop()
             track.deleteLater()
             self.on_track_resized()
@@ -340,6 +378,7 @@ class RobinhoodAdvancedTicker(QWidget):
             track.deleteLater()
         self.track_dict = {key: CharacterTrack(key, char, self.digit_font, self.neutral, self)
                            for key, char in slots.items()}
+        self._invalidate_tracks()
 
     def set_text(self, text, *, flash=True, animate=True):
         text = str(text)
@@ -361,6 +400,7 @@ class RobinhoodAdvancedTicker(QWidget):
             else:
                 for track in self.track_dict.values():
                     track.settle()
+                self._layout_cache = None
             self.update_geometry_size()
             self.update()
             return
@@ -390,6 +430,7 @@ class RobinhoodAdvancedTicker(QWidget):
                 if track is None:
                     track = CharacterTrack(key, char, self.digit_font, self.neutral, self)
                     self.track_dict[key] = track
+                    self._invalidate_tracks()
                     track.width_factor = track.opacity = 0.0
                     track.expand_in(self.SCRUB_WIDTH_MS if scrubbing else self.EXPAND_MS)
                     if track.is_digit and flash_color is not None:
@@ -424,6 +465,7 @@ class RobinhoodAdvancedTicker(QWidget):
                 self.remove_collapsed_track(track)
             else:
                 track.settle()
+        self._layout_cache = None
         self.update_geometry_size()
         self.update()
 
@@ -436,27 +478,29 @@ class RobinhoodAdvancedTicker(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         painter.setFont(self.digit_font)
-        x = 0.0
-        for track in self.ordered_tracks():
-            width = track.base_width * track.width_factor
-            if width > 0.1:
+        region = event.region()
+        for track, clip_rect in self._layout_tracks():
+            width = clip_rect.width()
+            x = clip_rect.x()
+            if width > 0.1 and region.intersects(track.paint_bounds):
                 painter.save()
                 painter.setOpacity(track.opacity)
                 painter.setPen(track.current_color)
-                painter.setClipRect(QRectF(x, 0, width, self.char_height))
+                painter.setClipRect(clip_rect)
                 if track.is_digit:
-                    center = int(round(track.current_offset))
-                    for value in range(center - 1, center + 2):
+                    center = round(track.current_offset)
+                    # At rest the neighboring glyphs are entirely clipped out.
+                    values = (center,) if track.current_offset == center else range(center - 1, center + 2)
+                    for value in values:
                         # Mirror the reel vertically while keeping its existing
                         # shortest circular path and in-flight offsets intact.
                         rect = QRectF(x, (track.current_offset - value) * self.char_height,
                                       track.base_width, self.char_height)
-                        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(value % 10))
+                        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, _DIGITS[value % 10])
                 else:
                     painter.drawText(QRectF(x, 0, track.base_width, self.char_height),
                                      Qt.AlignmentFlag.AlignCenter, track.char)
                 painter.restore()
-            x += width
         painter.end()
 
 

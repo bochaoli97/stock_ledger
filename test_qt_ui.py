@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import unittest
+from datetime import datetime, timedelta
 from decimal import Decimal as D
 from types import SimpleNamespace
 from unittest import mock
@@ -715,14 +716,78 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.errors, [])
 
     @staticmethod
-    def quote(price):
-        return Quote(price=D(price), prev_close=D("10"), time=None,
+    def quote(price, stamp=None):
+        return Quote(price=D(price), prev_close=D("10"), time=stamp,
                      points=[(1800000000, 10.0), (1800000300, 10.5)])
 
     def apply(self, price):
         self.app.v_live.set(True)
         quotes = {"SKYD": self.quote(price), "AAPL": self.quote("155")}
         self.app._apply_quotes(list(quotes), quotes)
+
+    def test_older_quotes_cannot_replace_prices_or_history_in_a_mixed_batch(self):
+        a = self.app
+        a.v_live.set(True)
+        stamp = datetime(2026, 11, 4, 10, 5)
+        current = {"SKYD": self.quote("11", stamp), "AAPL": self.quote("155", stamp)}
+        a._apply_quotes(list(current), current)
+        a.open_symbol("SKYD")
+        points = list(a.detail.hero.chart.values)
+        incoming = {"SKYD": self.quote("10.50", stamp - timedelta(minutes=5)),
+                    "AAPL": self.quote("154", stamp + timedelta(seconds=10))}
+        incoming["SKYD"].points = [(1800000000, 9.0), (1800000300, 9.5)]
+
+        with mock.patch.object(a.db, "set_prices", wraps=a.db.set_prices) as save:
+            a._apply_quotes(list(incoming), incoming)
+            save.assert_called_once_with({"AAPL": D(154)})
+
+        self.assertIs(a.quotes["SKYD"], current["SKYD"])
+        self.assertEqual(a.prices["SKYD"], D(11))
+        self.assertEqual(a.db.get_prices()["SKYD"][0], D(11))
+        self.assertEqual(a.detail.hero.now[0], "$11.00")
+        self.assertEqual(a.detail.hero.chart.values, points)
+        self.assertIs(a.quotes["AAPL"], incoming["AAPL"])
+        self.assertEqual(a.prices["AAPL"], D(154))
+
+    def test_newer_and_same_time_quotes_still_update_prices(self):
+        a = self.app
+        a.v_live.set(True)
+        stamp = datetime(2026, 11, 4, 10, 5)
+        for price, offset in (("11", 0), ("10.50", 10), ("10.51", 10)):
+            with self.subTest(price=price, seconds=offset):
+                quote = self.quote(price, stamp + timedelta(seconds=offset))
+                a._apply_quotes(["SKYD"], {"SKYD": quote})
+                self.assertIs(a.quotes["SKYD"], quote)
+                self.assertEqual(a.prices["SKYD"], D(price))
+                self.assertEqual(a.db.get_prices()["SKYD"][0], D(price))
+
+    def test_unchanged_price_advances_the_accepted_quote_time(self):
+        a = self.app
+        a.v_live.set(True)
+        stamp = datetime(2026, 11, 4, 10, 5)
+        a._apply_quotes(["SKYD"], {"SKYD": self.quote("11", stamp)})
+        newer = self.quote("11", stamp + timedelta(minutes=5))
+        with mock.patch.object(a.db, "set_prices", wraps=a.db.set_prices) as save:
+            a._apply_quotes(["SKYD"], {"SKYD": newer})
+            save.assert_not_called()
+        a._apply_quotes(["SKYD"], {"SKYD": self.quote("10.50", stamp + timedelta(minutes=3))})
+        self.assertIs(a.quotes["SKYD"], newer)
+        self.assertEqual(a.prices["SKYD"], D(11))
+        self.assertEqual(a.db.get_prices()["SKYD"][0], D(11))
+
+    def test_quotes_without_time_remain_compatible_but_cannot_replace_a_timed_quote(self):
+        a = self.app
+        a.v_live.set(True)
+        for price in ("10.50", "11"):
+            a._apply_quotes(["SKYD"], {"SKYD": self.quote(price)})
+            self.assertEqual(a.prices["SKYD"], D(price))
+        current = self.quote("12", datetime(2026, 11, 4, 10, 5))
+        a._apply_quotes(["SKYD"], {"SKYD": current})
+        with mock.patch.object(a.db, "set_prices", wraps=a.db.set_prices) as save:
+            a._apply_quotes(["SKYD"], {"SKYD": self.quote("10.50")})
+            save.assert_not_called()
+        self.assertIs(a.quotes["SKYD"], current)
+        self.assertEqual(a.prices["SKYD"], D(12))
 
     def test_only_the_three_requested_headlines_animate(self):
         a = self.app
