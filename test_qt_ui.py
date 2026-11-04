@@ -789,6 +789,78 @@ class AppTests(unittest.TestCase):
         self.assertIs(a.quotes["SKYD"], current)
         self.assertEqual(a.prices["SKYD"], D(12))
 
+    def test_live_toggle_preserves_quote_time_validation_for_each_symbol(self):
+        a = self.app
+        a.v_live.set(True)
+        stamp = datetime(2026, 11, 4, 10, 5)
+        current = {"SKYD": self.quote("11", stamp), "AAPL": self.quote("155", stamp)}
+        a._apply_quotes(list(current), current)
+        a.open_symbol("SKYD")
+        a.v_live.set(False)
+        a.toggle_live()
+        self.assertEqual(a.quotes, {})
+
+        incoming = {"SKYD": self.quote("10.50", stamp - timedelta(minutes=5)),
+                    "AAPL": self.quote("154", stamp + timedelta(seconds=10))}
+        with mock.patch.object(a, "run_bg") as background:
+            a.v_live.set(True)
+            a.toggle_live()
+            done = background.call_args.args[2]
+            with mock.patch.object(a.db, "set_prices", wraps=a.db.set_prices) as save:
+                done(incoming)
+                save.assert_called_once_with({"AAPL": D(154)})
+
+        self.assertEqual(a.prices["SKYD"], D(11))
+        self.assertEqual(a.db.get_prices()["SKYD"][0], D(11))
+        self.assertEqual(a.detail.hero.now[0], "$11.00")
+        self.assertEqual(a.prices["AAPL"], D(154))
+        newer = self.quote("10.25", stamp + timedelta(minutes=1))
+        a._apply_quotes(["SKYD"], {"SKYD": newer})
+        self.assertIs(a.quotes["SKYD"], newer)
+        self.assertEqual(a.prices["SKYD"], D("10.25"))
+        self.assertEqual(a.detail.hero.now[0], "$10.25")
+
+    def test_live_toggle_rejects_untimed_quotes_but_allows_same_time_corrections(self):
+        a = self.app
+        a.v_live.set(True)
+        stamp = datetime(2026, 11, 4, 10, 5)
+        a._apply_quotes(["SKYD"], {"SKYD": self.quote("11", stamp)})
+        a.v_live.set(False)
+        a.toggle_live()
+        with mock.patch.object(a, "run_bg") as background:
+            a.v_live.set(True)
+            a.toggle_live()
+            with mock.patch.object(a.db, "set_prices", wraps=a.db.set_prices) as save:
+                background.call_args.args[2]({"SKYD": self.quote("10.50")})
+                save.assert_not_called()
+        self.assertEqual(a.prices["SKYD"], D(11))
+        self.assertEqual(a.db.get_prices()["SKYD"][0], D(11))
+        corrected = self.quote("11.01", stamp)
+        a._apply_quotes(["SKYD"], {"SKYD": corrected})
+        self.assertIs(a.quotes["SKYD"], corrected)
+        self.assertEqual(a.prices["SKYD"], D("11.01"))
+        self.assertEqual(a.db.get_prices()["SKYD"][0], D("11.01"))
+
+    def test_quotes_ignored_while_live_is_off_do_not_advance_the_time_guard(self):
+        a = self.app
+        a.v_live.set(True)
+        stamp = datetime(2026, 11, 4, 10, 5)
+        a._apply_quotes(["SKYD"], {"SKYD": self.quote("11", stamp)})
+        a.v_live.set(False)
+        a.toggle_live()
+        a._apply_quotes(["SKYD"], {"SKYD": self.quote("12", stamp + timedelta(minutes=5))})
+        self.assertEqual(a.quotes, {})
+        self.assertEqual(a.prices["SKYD"], D(11))
+        self.assertEqual(a.db.get_prices()["SKYD"][0], D(11))
+        current = self.quote("11.50", stamp + timedelta(minutes=2))
+        with mock.patch.object(a, "run_bg") as background:
+            a.v_live.set(True)
+            a.toggle_live()
+            background.call_args.args[2]({"SKYD": current})
+        self.assertIs(a.quotes["SKYD"], current)
+        self.assertEqual(a.prices["SKYD"], D("11.50"))
+        self.assertEqual(a.db.get_prices()["SKYD"][0], D("11.50"))
+
     def test_only_the_three_requested_headlines_animate(self):
         a = self.app
         second = a.db.create_account("Second")

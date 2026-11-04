@@ -1704,6 +1704,7 @@ class App:
         self.prices: dict[str, Decimal] = {}
         self.price_info: dict[str, tuple[Decimal, str]] = {}
         self.quotes: dict[str, Quote] = {}  # live quotes (with today's intraday prices) fetched this session
+        self._quote_times: dict[str, float] = {}  # retain validation times when live quotes are cleared
         self.history: dict[tuple, tuple[float, dict[str, Quote] | None]] = {}  # chart data per range
         self._bg_queue: queue.Queue = queue.Queue()  # results from background threads
         self._fetching = False
@@ -2384,11 +2385,13 @@ class App:
         # before replacing either its quote/chart data or its persisted price.
         accepted = {}
         for symbol, quote in got.items():
-            previous = self.quotes.get(symbol)
-            if (previous is not None and previous.time is not None
-                    and (quote.time is None or quote.time.timestamp() < previous.time.timestamp())):
+            previous_time = self._quote_times.get(symbol)
+            quote_time = quote.time.timestamp() if quote.time is not None else None
+            if previous_time is not None and (quote_time is None or quote_time < previous_time):
                 continue
             accepted[symbol] = quote
+            if quote_time is not None:
+                self._quote_times[symbol] = quote_time
         self.quotes.update(accepted)
         # save prices that changed, so the last known price is still there when offline
         changed = {s: q.price for s, q in accepted.items() if self.prices.get(s) != q.price}
