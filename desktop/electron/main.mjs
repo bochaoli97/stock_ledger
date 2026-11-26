@@ -133,9 +133,11 @@ function registerIPC() {
       ? null
       : bridge.request("backup", { path: filePath });
   });
-  handle("ledger:export", async (kind, accountId) => {
+  handle("ledger:export", async (kind, accountId, range = {}) => {
     if (!["stock", "finance"].includes(kind))
       throw new Error("Invalid export type");
+    if (!range || typeof range !== "object" || Array.isArray(range))
+      throw new Error("Invalid export range");
     const { canceled, filePaths } = await dialog.showOpenDialog(window, {
       title: "Export CSV / 导出 CSV",
       properties: ["openDirectory", "createDirectory"],
@@ -146,6 +148,9 @@ function registerIPC() {
           kind,
           account_id: accountId,
           folder: filePaths[0],
+          period: range.period ?? "ALL",
+          first: range.first,
+          last: range.last,
         });
   });
   handle("ledger:open-data", async () => {

@@ -14,6 +14,27 @@ export function Icon({ name, size = 20 }: { name: string; size?: number }) {
     plus: <path d="M12 5v14M5 12h14" />,
     close: <path d="m6 6 12 12M18 6 6 18" />,
     back: <path d="m14 6-6 6 6 6" />,
+    forward: <path d="m10 6 6 6-6 6" />,
+    appearance: (
+      <>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 3v18" />
+        <path d="M12 3a9 9 0 0 1 0 18Z" fill="currentColor" stroke="none" />
+      </>
+    ),
+    database: (
+      <>
+        <ellipse cx="12" cy="5" rx="8" ry="3" />
+        <path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0" />
+      </>
+    ),
+    folder: <path d="M3 7V4h6l3 3h9v13H3Z" />,
+    monitor: (
+      <>
+        <rect x="3" y="4" width="18" height="13" rx="2" />
+        <path d="M8 21h8m-4-4v4" />
+      </>
+    ),
     search: (
       <>
         <circle cx="10.5" cy="10.5" r="6.5" />

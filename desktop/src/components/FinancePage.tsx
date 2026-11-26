@@ -7,6 +7,7 @@ import {
 } from "../types";
 import { useT } from "../i18n";
 import { Empty, errorText, Field, Gain, Icon, Modal } from "./common";
+import { CsvExportButton } from "./CsvExport";
 
 type Confirm = (
   title: string,
@@ -18,11 +19,13 @@ export function FinancePage({
   onChanged,
   confirm,
   report,
+  onNotice,
 }: {
   today: string;
   onChanged(): void;
   confirm: Confirm;
   report(error: unknown): void;
+  onNotice(message: string): void;
 }) {
   const t = useT();
   const [data, setData] = useState<FinanceData | null>(null),
@@ -67,10 +70,25 @@ export function FinancePage({
           </p>
           <h1>{t("Finance")}</h1>
         </div>
-        <button className="button primary" onClick={() => setEditor("new")}>
-          <Icon name="plus" size={17} />
-          {t("Add month")}
-        </button>
+        <div className="page-actions">
+          <CsvExportButton
+            kind="finance"
+            scope={t("Finance")}
+            initialRange={{ period, first, last }}
+            onNotice={onNotice}
+            periods={[
+              { code: "ALL", label: "All time" },
+              { code: "3M", label: "Past 3 months" },
+              { code: "6M", label: "Past 6 months" },
+              { code: "1Y", label: "Past year" },
+              ...years.map((year) => ({ code: year, label: year })),
+            ]}
+          />
+          <button className="button primary" onClick={() => setEditor("new")}>
+            <Icon name="plus" size={17} />
+            {t("Add month")}
+          </button>
+        </div>
       </div>
       <div className="stat-grid finance-stats">
         {[

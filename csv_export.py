@@ -76,19 +76,23 @@ def plain(d: Decimal) -> str:
 # ----------------------------------------------------------------------
 # A stock account
 # ----------------------------------------------------------------------
-def stock_tables(account: str, result: LedgerResult, prices: dict[str, Decimal], as_of: str) -> dict[str, Table]:
-    """The tables of one account, by name: transactions, holdings and yearly."""
+def stock_tables(account: str, result: LedgerResult, prices: dict[str, Decimal], as_of: str,
+                 first: str | None = None, last: str | None = None) -> dict[str, Table]:
+    """Period activity with original replayed balances; holdings use the supplied as-of result."""
     return {
-        "transactions": transaction_table(account, result),
+        "transactions": transaction_table(account, result, first, last),
         "holdings": holding_table(account, result, prices, as_of),
-        "yearly": yearly_table(account, result),
+        "yearly": yearly_table(account, result, first, last),
     }
 
 
-def transaction_table(account: str, result: LedgerResult) -> Table:
+def transaction_table(account: str, result: LedgerResult, first: str | None = None,
+                      last: str | None = None) -> Table:
     rows = []
     for row in result.rows:
         t = row.txn
+        if (first and t.date < first) or (last and t.date > last):
+            continue
         need = TYPE_FIELDS[t.type]
         sale = t.type == "SELL"
         proceeds = t.cash_change if sale else None  # quantity x price - fee
@@ -121,10 +125,13 @@ def holding_table(account: str, result: LedgerResult, prices: dict[str, Decimal]
     return [tr(h) for h in HOLDING_HEADERS], rows
 
 
-def yearly_table(account: str, result: LedgerResult) -> Table:
+def yearly_table(account: str, result: LedgerResult, first: str | None = None,
+                 last: str | None = None) -> Table:
     years: dict[str, dict[str, Decimal]] = {}  # year -> column title -> total
     for row in result.rows:
         t = row.txn
+        if (first and t.date < first) or (last and t.date > last):
+            continue
         totals = years.setdefault(t.date[:4], dict.fromkeys(YEARLY_TOTALS, ZERO))
         for title, code in YEARLY_TOTALS.items():
             if t.type == code:

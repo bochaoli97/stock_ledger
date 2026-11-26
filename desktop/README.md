@@ -49,7 +49,8 @@ STOCK_LEDGER_DB=/absolute/path/test.db npm --prefix desktop run dev
 - 持仓、成本、盈亏、股息、账户明细、个股历史与交易筛选。
 - 10 秒行情更新、股票搜索、手动价格、历史走势图与鼠标滑动查看。
 - 可选财务收支页：月份、金额算式、备注、余额承接、类别排序与时间范围筛选。
-- 深浅主题、中英文、字号、SQLite 备份与原有格式的 CSV 导出。
+- 深浅主题、中英文、字号、SQLite 备份与原有格式的 CSV 导出；CSV 入口位于账户概览／交易记录页和财务收支页，支持日期／月份范围并沿用页面的时间筛选。
+- 设置按外观、使用偏好、账户、本地数据和图形加速分组；设置可返回进入前的页面，动画测试支持返回设置，Escape 也遵循这一层级。
 - 设置中的「动画测试」提供明确标注的示例序列，用于检查动画，不会写入真实账本。
 
 ## 数字动画的约定
@@ -103,7 +104,7 @@ npm --prefix desktop run test:browser
 
 模型测试使用原组件生成的 **28 组场景、202 个检查点**，比较偏移、宽度、透明度、目标值、动画时长与颜色。颜色的整数舍入允许一个色阶差异。对照数据已冻结，当前测试和运行都不需要 Qt。
 
-真实窗口测试覆盖交易新增/编辑/删除、图表滑动/回位、数位接续、裁剪不变形、金额高亮、账户下拉的主题对比度与键盘操作、GPU 状态、多行备注保存，以及新建账户和合并视图。测试独占临时数据库；网络请求由测试进程中的固定数据替代，不连接 Yahoo，也不打开用户账本。
+真实窗口测试覆盖交易新增/编辑/删除、图表滑动/回位、数位接续、裁剪不变形、金额高亮、账户下拉的主题对比度与键盘操作、GPU 状态、多行备注保存、新建账户和合并视图，以及账户／财务 CSV 的实际导出、日期继承、无效范围与取消操作、设置返回导航。测试独占临时数据库；网络请求由测试进程中的固定数据替代，不连接 Yahoo，也不打开用户账本。
 
 可以在 Windows 的 Python 环境中一次完成独立构建、全部桌面交互、GPU 检查和 exe 启动验证：
 
@@ -115,11 +116,11 @@ python desktop/scripts/validate-windows.py --bootstrap-node --package --require-
 
 动画测试会记录每 50ms 更新一次目标时的帧间隔与 GPU 状态，写入 `test-results/`。Windows 的完整 GPU 信息包含实际活动设备和渲染后端；设置 → 图形加速也可以查看实际状态。
 
-3.0.1 验证结果：
+当前验证结果（从 WSL 调用 Windows 原生工具完成）：
 
-- Python 业务与服务：93 个无需图形环境的测试通过。旧界面专用测试已删除，业务、CSV、存储、行情和翻译测试保留。
+- Python 业务与服务：97 个无需图形环境的测试通过，包括筛选前成本与余额保留、包含边界、单侧边界、空范围、月份承接和文件名区分。
 - TypeScript 动画模型、进程通信、数据路径与 GPU 状态：39 个测试通过。
-- Windows 原生窗口的 7 个交互测试全部通过，包括金额拖选、账户下拉深浅主题、备注换行及重新打开后的持久化验证。
+- Windows 原生窗口的 10 个交互测试全部通过，包括 CSV 实际文件内容、时间筛选继承、原生文件夹选择取消、设置页深浅主题及返回导航。
 - Windows exe 的独立启动通过，包含中文账户、SQLite 和内置 Python 服务；无需安装 Python 即可运行。ZIP 已通过 CRC 与 SHA-256 校验，不包含用户数据库。
 - Windows 实测活动设备为 **NVIDIA GeForce RTX 3060**，渲染器为 **ANGLE / Direct3D 11**，硬件加速、GPU 合成与光栅化均已启用。
 - Windows 每 50ms 切换目标，约 1.8 秒收集 108 个帧间隔：中位数 **16.7ms**，P95 **16.8ms**。帧间隔为 requestAnimationFrame 回调间隔；120Hz、macOS 和与 Robinhood 客户端的同机对比尚未验证。
@@ -128,10 +129,27 @@ python desktop/scripts/validate-windows.py --bootstrap-node --package --require-
 
 ## 打包
 
-在**目标操作系统**上安装 Python 的打包工具，然后执行：
+### WSL 一键生成 Windows 可运行压缩包
+
+在 Windows 安装 Python 3.12+（包含 pip、venv），确认 WSL 能调用 `powershell.exe`，然后在仓库根目录运行：
 
 ```bash
-python -m pip install pyinstaller
+bash build_windows.sh
+```
+
+完整的环境准备、逐步流程、输出、参数及排错见 [中文打包指南](../README.zh-CN.md#在-wsl-中一键打包-windows-版)。脚本调用 `scripts/build-windows.ps1`，自动查找 Windows Python，再运行 `scripts/validate-windows.py --bootstrap-node --package --archive`。在 Windows 独立临时目录中完成构建，未安装合适的 Windows Node.js 24+ 时会下载并校验官方便携版；Python 打包依赖安装在临时虚拟环境中。
+
+默认执行业务、服务、前端单元和原生窗口测试，并启动最终 exe 验证内置 Python、中文与 SQLite。`--skip-tests` 可跳过前四项，最终 exe 验证仍会运行。`--require-gpu` 会额外要求硬件 GPU 合成；`--python` 指定 Windows Python；`--work-dir` 指定可复用的 Windows 临时构建目录。
+
+输出为 `desktop/release/StockLedger-Windows-<arch>.zip`，完整解压后打开 `StockLedger/Stock Ledger.exe`。ZIP 排除用户数据库，并校验 CRC 和 SHA-256；报告和日志在 `desktop/test-results/windows-native/`。无需在目标电脑安装 Python 或 Node.js。
+
+### 在目标系统生成安装包
+
+在**目标操作系统**上安装 Python 的打包工具与前端依赖，然后执行：
+
+```bash
+python -m pip install -r desktop/requirements-build.txt
+npm --prefix desktop ci
 npm --prefix desktop run package
 ```
 
@@ -147,7 +165,7 @@ npm --prefix desktop run package:dir
 npm --prefix desktop run test:package
 ```
 
-Python 服务通过 PyInstaller 打包，Electron 安装包附带服务可执行文件；用户不需要另外安装 Python。WSL 构建的是 Linux 版本，Windows 版本应在 Windows 的 Node.js 与 Python 环境中构建。
+Python 服务通过 PyInstaller 打包，Electron 安装包附带服务可执行文件；用户不需要另外安装 Python。直接用 WSL 的 Linux 工具执行 `npm run package` 会生成 Linux 版本；`build_windows.sh` 则从 WSL 调用 Windows 工具生成 Windows 版本。
 
 打包版优先使用程序目录旁的 `data/`，目录不可写时使用系统用户数据目录。升级旧程序时保持原数据目录，或通过 `STOCK_LEDGER_DB` 明确指定原数据库。程序不上传账本；开启行情与搜索时仍由原 `quotes.py` 访问 Yahoo。
 

@@ -5,7 +5,14 @@ import {
   type ElectronApplication,
   type Page,
 } from "@playwright/test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
@@ -449,4 +456,199 @@ test("settings shows actual GPU mode, adapter and rendering backend", async () =
   await page.screenshot({
     path: test.info().outputPath("graphics-status.png"),
   });
+});
+
+test("account CSV uses activity dates, validates bounds and exports through the native dialog", async () => {
+  await page.evaluate(async () => {
+    const state = await window.ledger!.request<{ account_id: number }>(
+      "snapshot",
+    );
+    for (const [date, note] of [
+      ["2026-02-01", "February export"],
+      ["2026-03-01", "March excluded"],
+    ])
+      await window.ledger!.request("transaction.save", {
+        account_id: state.account_id,
+        date,
+        type: "DEPOSIT",
+        amount: "100",
+        note,
+      });
+  });
+  await page.reload();
+  await page
+    .getByRole("button", { name: "Export account CSV", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByLabel("Time range", { exact: true })).toHaveValue(
+    "ALL",
+  );
+  await dialog.getByLabel("Time range", { exact: true }).selectOption("CUSTOM");
+  await dialog.getByLabel("From", { exact: true }).fill("2026-03-01");
+  await dialog.getByLabel("To", { exact: true }).fill("2026-02-01");
+  await expect(dialog.getByRole("alert")).toHaveText("Start must precede end");
+  await expect(
+    dialog.getByRole("button", { name: "Choose folder and export" }),
+  ).toBeDisabled();
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("button", { name: "Activity", exact: true }).click();
+  await page.getByLabel("All time", { exact: true }).selectOption("CUSTOM");
+  await page.getByLabel("From", { exact: true }).fill("2026-02-01");
+  await page.getByLabel("To", { exact: true }).fill("2026-02-28");
+  await page
+    .getByRole("button", { name: "Export account CSV", exact: true })
+    .click();
+  await expect(dialog.getByLabel("From", { exact: true })).toHaveValue(
+    "2026-02-01",
+  );
+  await expect(dialog.getByLabel("To", { exact: true })).toHaveValue(
+    "2026-02-28",
+  );
+  await app.evaluate(({ dialog }) => {
+    dialog.showOpenDialog = async () => ({ canceled: true, filePaths: [] });
+  });
+  await dialog
+    .getByRole("button", { name: "Choose folder and export" })
+    .click();
+  await expect(dialog).toBeVisible();
+  const folder = path.join(temporary, "account-exports");
+  await mkdir(folder);
+  await app.evaluate(({ dialog }, folder) => {
+    dialog.showOpenDialog = async () => ({
+      canceled: false,
+      filePaths: [folder],
+    });
+  }, folder);
+  await dialog
+    .getByRole("button", { name: "Choose folder and export" })
+    .click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByRole("status")).toContainText("CSV exported");
+  const names = await readdir(folder);
+  expect(names).toHaveLength(3);
+  expect(names.every((name) => name.includes("2026-02-01_to_2026-02-28"))).toBe(
+    true,
+  );
+  const transactions = await readFile(
+    path.join(
+      folder,
+      names.find((name) => name.includes("_transactions_"))!,
+    ),
+    "utf8",
+  );
+  expect(transactions).toContain("February export");
+  expect(transactions).not.toContain("March excluded");
+  expect(transactions).not.toContain("2026-01-01");
+});
+
+test("finance CSV inherits month filters and preserves the carried opening balance", async () => {
+  await page.evaluate(async () => {
+    const data = await window.ledger!.request<{
+      categories: { id: number; kind: string }[];
+    }>("finance.snapshot");
+    const category = data.categories.find(
+      (category) => category.kind === "income",
+    )!.id;
+    await window.ledger!.request("finance.month.save", {
+      month: "2026-01",
+      opening: "100",
+      entries: { [category]: { raw: "1000" } },
+    });
+    await window.ledger!.request("finance.month.save", {
+      month: "2026-02",
+      entries: {
+        [category]: { raw: "500", comment: "Filtered finance entry" },
+      },
+    });
+  });
+  await page.getByRole("button", { name: "Finance", exact: true }).click();
+  await expect(
+    page.getByRole("row").filter({ hasText: "2026-02" }),
+  ).toBeVisible();
+  await page.getByLabel("All time", { exact: true }).selectOption("CUSTOM");
+  await page.getByLabel("From", { exact: true }).fill("2026-02");
+  await page.getByLabel("To", { exact: true }).fill("2026-02");
+  await page
+    .getByRole("button", { name: "Export finance CSV", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByLabel("From", { exact: true })).toHaveValue(
+    "2026-02",
+  );
+  await expect(dialog.getByLabel("To", { exact: true })).toHaveAttribute(
+    "type",
+    "month",
+  );
+  const folder = path.join(temporary, "finance-exports");
+  await mkdir(folder);
+  await app.evaluate(({ dialog }, folder) => {
+    dialog.showOpenDialog = async () => ({
+      canceled: false,
+      filePaths: [folder],
+    });
+  }, folder);
+  await dialog
+    .getByRole("button", { name: "Choose folder and export" })
+    .click();
+  await expect(dialog).toBeHidden();
+  const names = await readdir(folder);
+  expect(names).toHaveLength(3);
+  const monthly = await readFile(
+    path.join(
+      folder,
+      names.find((name) => name.includes("_monthly_"))!,
+    ),
+    "utf8",
+  );
+  expect(monthly).toContain("2026-02,1100.00,500.00");
+  expect(monthly).not.toContain("2026-01");
+});
+
+test("settings cards support both themes and return to the originating page", async () => {
+  await page.getByRole("button", { name: "Finance", exact: true }).click();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(page.locator(".settings-card")).toHaveCount(5);
+  await expect(
+    page.getByRole("button", { name: "Export account CSV", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Export finance CSV", exact: true }),
+  ).toHaveCount(0);
+  await page.screenshot({
+    path: test.info().outputPath("settings-dark.png"),
+    fullPage: true,
+  });
+  await page.getByLabel("Dark mode", { exact: true }).uncheck();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await page.screenshot({
+    path: test.info().outputPath("settings-light.png"),
+    fullPage: true,
+  });
+  await page
+    .getByRole("button", { name: "Animation studio", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Back to settings", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Settings", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Animation studio", exact: true })
+    .click();
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("heading", { name: "Settings", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Back to previous page", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Finance", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("heading", { name: "Finance", exact: true }),
+  ).toBeVisible();
 });
