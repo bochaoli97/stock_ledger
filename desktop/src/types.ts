@@ -156,9 +156,15 @@ export type LedgerAPI = {
   exportCsv(
     kind: "stock" | "finance",
     accountId: number | null,
+    range?: CsvExportRange,
   ): Promise<string[] | null>;
   openDataFolder(): Promise<void>;
   runtime(): Promise<RuntimeInfo>;
+};
+export type CsvExportRange = {
+  period: string;
+  first?: string;
+  last?: string;
 };
 declare global {
   interface Window {

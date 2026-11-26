@@ -1,12 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import packageInfo from "../package.json";
 import {
   api,
   type Account,
   type ChartData,
   type ChartPoint,
   type Holding,
-  type RuntimeInfo,
   type Settings,
   type Snapshot,
   type Transaction,
@@ -19,6 +17,8 @@ import {
   TransactionEditor,
 } from "./components/Editors";
 import { FinancePage } from "./components/FinancePage";
+import { CsvExportButton } from "./components/CsvExport";
+import { SettingsPage } from "./components/SettingsPage";
 import { AnimationStudio } from "./components/AnimationStudio";
 import { NumberTicker, type TickerHandle } from "./components/NumberTicker";
 import { AccountSelect } from "./components/AccountSelect";
@@ -81,6 +81,23 @@ function LedgerApp({ initial }: { initial: Snapshot }) {
   const account = useRef(data.account_id),
     context = useRef(0),
     settingsRevision = useRef(0);
+  const settingsOrigin = useRef<{ page: Page; symbol: string | null }>({
+    page: "overview",
+    symbol: null,
+  });
+  const openSettings = () => {
+    if (page !== "settings" && page !== "studio")
+      settingsOrigin.current = { page, symbol };
+    setPage("settings");
+  };
+  const backFromSettings = () => {
+    setPage(
+      settingsOrigin.current.page === "finance" && !data.settings.finance
+        ? "overview"
+        : settingsOrigin.current.page,
+    );
+    setSymbol(settingsOrigin.current.symbol);
+  };
   account.current = data.account_id;
   const report = useCallback((e: unknown) => setError(errorText(e)), []);
   const refresh = useCallback(() => {
@@ -243,13 +260,17 @@ function LedgerApp({ initial }: { initial: Snapshot }) {
         refresh();
       }
       if (e.key === "Escape") {
-        setSymbol(null);
-        setPage("overview");
+        if (page === "studio") setPage("settings");
+        else if (page === "settings") backFromSettings();
+        else {
+          setSymbol(null);
+          setPage("overview");
+        }
       }
     };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
-  }, [page, symbol, refresh]);
+  }, [page, symbol, refresh, data.settings.finance]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(""), 7000);
@@ -281,7 +302,7 @@ function LedgerApp({ initial }: { initial: Snapshot }) {
           setEditor({ kind: "transaction", symbol: symbol ?? undefined })
         }
         updating={updating}
-        onSettings={() => setPage("settings")}
+        onSettings={openSettings}
         onSymbol={(value) => {
           setSymbol(value);
           setPage("overview");
@@ -309,6 +330,27 @@ function LedgerApp({ initial }: { initial: Snapshot }) {
           <FirstAccount onAdd={() => setEditor({ kind: "account" })} />
         ) : page === "overview" ? (
           <>
+            {!symbol && data.account_id !== null && data.account_id !== -1 && (
+              <div className="account-toolbar">
+                <div>
+                  <p className="eyebrow">
+                    <Translated text="Account" />
+                  </p>
+                  <strong>
+                    {data.accounts.find((a) => a.id === data.account_id)?.name}
+                  </strong>
+                </div>
+                <CsvExportButton
+                  kind="stock"
+                  accountId={data.account_id}
+                  scope={
+                    data.accounts.find((a) => a.id === data.account_id)?.name
+                  }
+                  periods={data.periods}
+                  onNotice={setNotice}
+                />
+              </div>
+            )}
             {symbol && (
               <button
                 className="back-link"
@@ -409,6 +451,7 @@ function LedgerApp({ initial }: { initial: Snapshot }) {
         ) : page === "activity" ? (
           <Activity
             data={data}
+            onNotice={setNotice}
             onEdit={(txn) => setEditor({ kind: "transaction", initial: txn })}
             onDelete={(txn) =>
               confirm(
@@ -430,9 +473,13 @@ function LedgerApp({ initial }: { initial: Snapshot }) {
             onChanged={refresh}
             confirm={confirm}
             report={report}
+            onNotice={setNotice}
           />
         ) : page === "studio" ? (
-          <AnimationStudio neutral={neutral} />
+          <AnimationStudio
+            neutral={neutral}
+            onBack={() => setPage("settings")}
+          />
         ) : (
           <SettingsPage
             data={data}
@@ -443,6 +490,7 @@ function LedgerApp({ initial }: { initial: Snapshot }) {
             onEditAccount={(a) => setEditor({ kind: "account", initial: a })}
             onPrices={() => setEditor({ kind: "prices" })}
             onStudio={() => setPage("studio")}
+            onBack={backFromSettings}
             onDeleteAccount={(a) =>
               confirm(
                 "Delete account",
@@ -580,7 +628,7 @@ function Shell({
             onChange={selectAccount}
           />
           <button
-            className={`icon-button ${page === "settings" ? "selected" : ""}`}
+            className={`icon-button ${page === "settings" || page === "studio" ? "selected" : ""}`}
             aria-label={t("Settings")}
             onClick={onSettings}
           >
@@ -1015,12 +1063,14 @@ function Activity({
   compact = false,
   onEdit,
   onDelete,
+  onNotice,
 }: {
   data: Snapshot;
   symbol?: string;
   compact?: boolean;
   onEdit(txn: Transaction): void;
   onDelete(txn: Transaction): void;
+  onNotice?(message: string): void;
 }) {
   const t = useT();
   const [query, setQuery] = useState(""),
@@ -1062,7 +1112,25 @@ function Activity({
     <section className="section activity">
       <div className="section-heading">
         <h2>{t(symbol ? "Transactions" : "Activity")}</h2>
-        <span className="muted count">{rows.length}</span>
+        <div className="page-actions">
+          <span className="muted count">{rows.length}</span>
+          {onNotice &&
+            !compact &&
+            !symbol &&
+            data.account_id !== null &&
+            data.account_id !== -1 && (
+              <CsvExportButton
+                kind="stock"
+                accountId={data.account_id}
+                scope={
+                  data.accounts.find((a) => a.id === data.account_id)?.name
+                }
+                periods={data.periods}
+                initialRange={{ period, first, last }}
+                onNotice={onNotice}
+              />
+            )}
+        </div>
       </div>
       {!compact && (
         <div className="filters activity-filters">
@@ -1261,273 +1329,6 @@ function Activity({
   );
 }
 
-function SettingsPage({
-  data,
-  onChange,
-  report,
-  onNotice,
-  onAddAccount,
-  onEditAccount,
-  onDeleteAccount,
-  onPrices,
-  onStudio,
-}: {
-  data: Snapshot;
-  onChange(changes: Partial<Settings>): void;
-  report(error: unknown): void;
-  onNotice(message: string): void;
-  onAddAccount(): void;
-  onEditAccount(a: Account): void;
-  onDeleteAccount(a: Account): void;
-  onPrices(): void;
-  onStudio(): void;
-}) {
-  const t = useT(),
-    [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
-  useEffect(() => {
-    api().runtime().then(setRuntime).catch(report);
-  }, [report]);
-  const native = async (fn: () => Promise<unknown>, message: string) => {
-    try {
-      const result = await fn();
-      if (result)
-        onNotice(
-          `${t(message)}: ${Array.isArray(result) ? result.join(", ") : result}`,
-        );
-    } catch (e) {
-      report(e);
-    }
-  };
-  return (
-    <section className="settings-page">
-      <div className="page-heading">
-        <h1>{t("Settings")}</h1>
-      </div>
-      <div className="settings-group">
-        <h2>{t("Appearance")}</h2>
-        <label className="setting-row">
-          <span>{t("Dark mode")}</span>
-          <input
-            className="switch"
-            type="checkbox"
-            checked={data.settings.theme === "dark"}
-            onChange={(e) =>
-              onChange({ theme: e.target.checked ? "dark" : "light" })
-            }
-          />
-        </label>
-        <label className="setting-row">
-          <span>{t("Language")}</span>
-          <select
-            aria-label={t("Language")}
-            value={data.settings.language}
-            onChange={(e) =>
-              onChange({ language: e.target.value as "en" | "zh" })
-            }
-          >
-            <option value="zh">中文</option>
-            <option value="en">English</option>
-          </select>
-        </label>
-        <label className="setting-row">
-          <span>{t("Text size")}</span>
-          <select
-            aria-label={t("Text size")}
-            value={data.settings.text_size}
-            onChange={(e) => onChange({ text_size: e.target.value })}
-          >
-            {["Small", "Standard", "Large", "Extra large"].map((key) => (
-              <option key={key} value={key}>
-                {t(key)}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-      <section
-        className="settings-group gpu-status-card"
-        data-mode={runtime?.graphics.mode ?? "unknown"}
-      >
-        <div className="section-heading compact">
-          <h2>{t("Graphics acceleration")}</h2>
-          <button
-            className="text-button"
-            disabled={!runtime}
-            onClick={() => {
-              setRuntime(null);
-              api().runtime().then(setRuntime).catch(report);
-            }}
-          >
-            {t("Refresh graphics info")}
-          </button>
-        </div>
-        <p className="gpu-status">
-          <i />
-          {t(
-            !runtime
-              ? "Checking graphics"
-              : runtime.graphics.mode === "hardware"
-                ? "Hardware acceleration enabled"
-                : runtime.graphics.mode === "software"
-                  ? "Software rendering"
-                  : "Graphics information unavailable",
-          )}
-        </p>
-        {runtime && (
-          <dl className="gpu-info">
-            <div>
-              <dt>{t("Graphics device")}</dt>
-              <dd>
-                {runtime.graphics.devices
-                  .map((device) => device.name)
-                  .join(" · ") || t("Graphics information unavailable")}
-              </dd>
-            </div>
-            <div>
-              <dt>{t("Renderer")}</dt>
-              <dd>
-                {runtime.graphics.renderer ||
-                  t("Selected automatically by the system")}
-              </dd>
-            </div>
-            <div>
-              <dt>{t("GPU compositing")}</dt>
-              <dd>{runtime.gpu.gpu_compositing ?? "unknown"}</dd>
-            </div>
-          </dl>
-        )}
-      </section>
-      <div className="settings-group">
-        <h2>{t("Accounts")}</h2>
-        {data.accounts.map((a) => (
-          <div className="setting-row" key={a.id}>
-            <div>
-              <strong>{a.name}</strong>
-              <small>{a.broker}</small>
-            </div>
-            <div className="row-actions">
-              <button
-                className="icon-button"
-                aria-label={t("Edit account")}
-                onClick={() => onEditAccount(a)}
-              >
-                <Icon name="edit" size={17} />
-              </button>
-              <button
-                className="icon-button"
-                aria-label={t("Delete account")}
-                onClick={() => onDeleteAccount(a)}
-              >
-                <Icon name="trash" size={17} />
-              </button>
-            </div>
-          </div>
-        ))}
-        <button className="text-button" onClick={onAddAccount}>
-          <Icon name="plus" size={16} />
-          {t("Add account")}
-        </button>
-      </div>
-      <div className="settings-group">
-        <label className="setting-row">
-          <span>
-            <strong>{t("Live prices")}</strong>
-            <small>{t("Refreshes every 10 seconds")}</small>
-          </span>
-          <input
-            className="switch"
-            type="checkbox"
-            checked={data.settings.live}
-            onChange={(e) => onChange({ live: e.target.checked })}
-          />
-        </label>
-        <label className="setting-row">
-          <span>
-            <strong>{t("Finance page")}</strong>
-            <small>{t("Track money outside your brokerage accounts")}</small>
-          </span>
-          <input
-            className="switch"
-            type="checkbox"
-            checked={data.settings.finance}
-            onChange={(e) => onChange({ finance: e.target.checked })}
-          />
-        </label>
-        <button className="text-button" onClick={onPrices}>
-          {t("Manage prices")}
-        </button>
-      </div>
-      <div className="settings-group">
-        <h2>{t("Local data")}</h2>
-        <div className="settings-buttons">
-          <button
-            className="button secondary"
-            onClick={() => native(() => api().backup(), "Backup saved")}
-          >
-            {t("Back up database")}
-          </button>
-          <button
-            className="button secondary"
-            disabled={data.account_id === null || data.account_id === -1}
-            onClick={() =>
-              native(
-                () => api().exportCsv("stock", data.account_id),
-                "CSV exported",
-              )
-            }
-          >
-            {t("Export account CSV")}
-          </button>
-          {data.settings.finance && (
-            <button
-              className="button secondary"
-              onClick={() =>
-                native(
-                  () => api().exportCsv("finance", data.account_id),
-                  "CSV exported",
-                )
-              }
-            >
-              {t("Export finance CSV")}
-            </button>
-          )}
-          <button
-            className="button secondary"
-            onClick={() => api().openDataFolder().catch(report)}
-          >
-            {t("Open data folder")}
-          </button>
-        </div>
-      </div>
-      <div className="settings-group">
-        <h2>{t("About")}</h2>
-        <p className="muted">Stock Ledger {packageInfo.version}</p>
-        <button className="text-button" onClick={onStudio}>
-          {t("Animation studio")}
-        </button>
-        <details className="runtime-details">
-          <summary>{t("Rendering details")}</summary>
-          {runtime && (
-            <>
-              <p>
-                Chromium {runtime.chrome} · Electron {runtime.electron}
-              </p>
-              <p className="database-path">{runtime.database}</p>
-              <dl>
-                {Object.entries(runtime.gpu).map(([key, value]) => (
-                  <div key={key}>
-                    <dt>{key}</dt>
-                    <dd>{value}</dd>
-                  </div>
-                ))}
-              </dl>
-            </>
-          )}
-        </details>
-      </div>
-    </section>
-  );
-}
 function ConfirmDialog({
   title,
   message,

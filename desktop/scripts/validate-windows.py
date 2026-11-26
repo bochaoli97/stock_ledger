@@ -105,11 +105,15 @@ def main() -> None:
     parser.add_argument("--package", action="store_true", help="Build and smoke-test the Windows executable")
     parser.add_argument("--archive", action="store_true", help="Also save a verified Windows zip in desktop/release")
     parser.add_argument("--require-gpu", action="store_true", help="Fail when hardware GPU compositing is unavailable")
+    parser.add_argument("--skip-tests", action="store_true",
+                        help="Skip unit and development-window tests; packaged exe smoke test still runs")
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument("--output", type=Path, default=ROOT / "desktop/test-results/windows-native")
     options = parser.parse_args()
     if options.archive and not options.package:
         parser.error("--archive requires --package")
+    if options.skip_tests and not options.package:
+        parser.error("--skip-tests requires --package")
     work = options.work_dir or Path(tempfile.mkdtemp(prefix="StockLedgerDesktop-native-"))
     work = work.resolve()
     marker = work / ".stock-ledger-validation"
@@ -126,9 +130,15 @@ def main() -> None:
         shutil.rmtree(logs)
     logs.mkdir(exist_ok=True)
     report = {"status": "running", "work_directory": str(work), "packaged": options.package,
-              "require_gpu": options.require_gpu, "python": sys.version.split()[0]}
+              "require_gpu": options.require_gpu, "tests_skipped": options.skip_tests,
+              "python": sys.version.split()[0]}
     try:
         existing_node = shutil.which("node")
+        if existing_node:
+            version = subprocess.check_output([existing_node, "--version"], text=True).strip()
+            if int(version.removeprefix("v").split(".")[0]) < 24:
+                print(f"[Windows] Node.js {version} is too old; Node.js 24+ is required", flush=True)
+                existing_node = None
         node = Path(existing_node) if existing_node else portable_node(work) if options.bootstrap_node else None
         if node is None:
             raise RuntimeError("Install Node.js 24 LTS or pass --bootstrap-node")
@@ -170,8 +180,9 @@ def main() -> None:
             environment.pop("STOCK_LEDGER_REQUIRE_GPU", None)
         desktop = project / "desktop"
         npm_command = [str(node), str(npm)]
-        run("Python core tests", [str(python), "test_ledger.py"], project, environment, logs)
-        run("Python service tests", [str(python), "-m", "unittest", "-q", "test_desktop_backend"], project, environment, logs)
+        if not options.skip_tests:
+            run("Python core tests", [str(python), "test_ledger.py"], project, environment, logs)
+            run("Python service tests", [str(python), "-m", "unittest", "-q", "test_desktop_backend"], project, environment, logs)
         run("Install dependencies", npm_command + ["ci", "--cache", str(work / "npm-cache"), "--no-audit", "--no-fund"],
             desktop, environment, logs)
         if options.package:
@@ -179,8 +190,9 @@ def main() -> None:
                                         "-r", str(desktop / "requirements-build.txt")], desktop, environment, logs)
         run("Build Windows app" if options.package else "Build renderer",
             npm_command + ["run", "package:dir" if options.package else "build"], desktop, environment, logs)
-        run("Unit tests", npm_command + ["test"], desktop, environment, logs)
-        run("Native window tests", npm_command + ["run", "test:browser"], desktop, environment, logs)
+        if not options.skip_tests:
+            run("Unit tests", npm_command + ["test"], desktop, environment, logs)
+            run("Native window tests", npm_command + ["run", "test:browser"], desktop, environment, logs)
         if options.package:
             run("Packaged executable test", npm_command + ["run", "test:package"], desktop, environment, logs)
             report["executable"] = str(desktop / "release/win-unpacked/Stock Ledger.exe")

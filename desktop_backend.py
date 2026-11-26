@@ -497,14 +497,39 @@ class LedgerService:
             self.db.backup_to(path)
             return str(path)
         if method == "export":
-            if params.get("kind") == "finance":
+            kind = params.get("kind", "stock")
+            if kind not in ("stock", "finance"):
+                raise ServiceError("Invalid export type")
+            period = str(params.get("period", "ALL"))
+            if period not in ("ALL", "CUSTOM", "3M", "6M", "1Y") and not (
+                    kind == "stock" and period == "1M") and not re.fullmatch(r"[0-9]{4}", period):
+                raise ServiceError("Invalid export period")
+            if period == "CUSTOM":
+                parse = parse_month if kind == "finance" else parse_date
+                first = parse(params["first"]) if params.get("first") else None
+                last = parse(params["last"]) if params.get("last") else None
+            elif kind == "finance":
+                first, last = month_range(period, month_of(today()))
+            else:
+                first, last = period_range(period)
+            if first and last and first > last:
+                raise ServiceError("Start must precede end")
+            if kind == "finance":
                 cats = self.db.list_finance_categories()
-                tables, base = finance_tables(finance_rows(self.db.list_finance_months(), cats), cats), "finance"
+                rows = finance_rows(self.db.list_finance_months(), cats)
+                tables, base = finance_tables(period_months(rows, first, last), cats), "finance"
             else:
                 aid = self.account_id(params.get("account_id"), single=True)
                 account = next(a for a in self.accounts() if a["id"] == aid)
                 base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", account["name"]).strip(". ") or "account"
-                tables = stock_tables(account["name"], self.result(aid), self.prices(), today())
+                # Replay the complete history through the end date before filtering activity.
+                # A sale in the selected period can depend on purchases from earlier periods.
+                result = replay(t for t in self.db.list_txns(aid) if not last or t.date <= last)
+                as_of = last or today()
+                prices = self.prices() if as_of == today() else {}
+                tables = stock_tables(account["name"], result, prices, as_of, first, last)
+            if first or last:
+                base += f"_{first or 'start'}_to_{last or 'latest'}"
             return [str(p) for p in write_tables(params["folder"], base, today(), tables)]
         raise ServiceError("Unknown service method", "METHOD_NOT_FOUND")
 

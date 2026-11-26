@@ -30,7 +30,13 @@ const sequences: Record<string, string[]> = {
     "$0.00",
   ],
 };
-export function AnimationStudio({ neutral }: { neutral: string }) {
+export function AnimationStudio({
+  neutral,
+  onBack,
+}: {
+  neutral: string;
+  onBack(): void;
+}) {
   const t = useT(),
     ticker = useRef<TickerHandle>(null);
   const [sequence, setSequence] = useState("Carry & borrow"),
@@ -55,6 +61,10 @@ export function AnimationStudio({ neutral }: { neutral: string }) {
   }, [running, sequence, speed, scrub]);
   return (
     <section className="studio">
+      <button className="back-link" onClick={onBack}>
+        <Icon name="back" size={17} />
+        {t("Back to settings")}
+      </button>
       <div className="page-heading">
         <div>
           <p className="eyebrow">{t("Animation preview")}</p>

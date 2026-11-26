@@ -8,7 +8,8 @@ async function invoke(channel, ...args) {
 contextBridge.exposeInMainWorld("ledger", {
   request: (method, params = {}) => invoke("ledger:request", method, params),
   backup: () => invoke("ledger:backup"),
-  exportCsv: (kind, accountId) => invoke("ledger:export", kind, accountId),
+  exportCsv: (kind, accountId, range = {}) =>
+    invoke("ledger:export", kind, accountId, range),
   openDataFolder: () => invoke("ledger:open-data"),
   runtime: () => invoke("ledger:runtime"),
 });

@@ -1,4 +1,5 @@
 """Regression tests for the headless bridge; never open the user's database."""
+import csv
 import json
 import os
 import subprocess
@@ -135,6 +136,92 @@ class DesktopServiceTests(unittest.TestCase):
         self.service.dispatch("settings.save", {"finance": False})
         self.service.dispatch("settings.save", {"finance": True})
         self.assertEqual(self.service.finance_snapshot({})["summary"]["ending"], "$22.00")
+
+    def exported_tables(self, **params):
+        files = self.service.dispatch("export", {"folder": self.folder.name, **params})
+        tables = {}
+        for filename in files:
+            with Path(filename).open(encoding="utf-8-sig", newline="") as stream:
+                table = next(name for name in ("transactions", "holdings", "yearly", "monthly", "entries")
+                             if f"_{name}_" in Path(filename).name)
+                tables[table] = list(csv.DictReader(stream))
+        return tables
+
+    def test_stock_export_filters_activity_after_replaying_earlier_costs_and_balances(self):
+        aid = self.account(cash="1000")
+        self.txn(aid)
+        self.txn(aid, type="SELL", quantity="1", price="150", fee="2", date="2026-02-15")
+        self.txn(aid, quantity="1", price="200", date="2026-03-01")
+        before = self.service.db.list_txns(aid)
+        tables = self.exported_tables(account_id=aid, period="CUSTOM", first="2026-02-01", last="2026-02-28")
+        self.assertEqual(len(tables["transactions"]), 1)
+        sale = tables["transactions"][0]
+        self.assertEqual(sale["Date"], "2026-02-15")
+        self.assertEqual(sale["Cash Balance"], "948.00")
+        self.assertEqual(sale["Cost Sold"], "100.00")
+        self.assertEqual(sale["Realized P/L"], "48.00")
+        holding, cash = tables["holdings"]
+        self.assertEqual((holding["As Of"], holding["Shares"], holding["Cost Basis"]),
+                         ("2026-02-28", "1", "100.00"))
+        self.assertEqual((holding["Price"], holding["Market Value"]), ("", ""))
+        self.assertEqual(cash["Market Value"], "948.00")
+        self.assertEqual(tables["yearly"][0]["Deposits"], "0.00")
+        self.assertEqual(tables["yearly"][0]["Realized P/L"], "48.00")
+        self.assertEqual(self.service.db.list_txns(aid), before)
+
+    def test_stock_export_inclusive_bounds_open_bounds_empty_range_and_year(self):
+        aid = self.account(cash="1000")
+        self.txn(aid)
+        self.txn(aid, date="2026-02-02")
+        for bounds, expected in [
+            ({"first": "2026-01-02", "last": "2026-01-02"}, ["2026-01-02"]),
+            ({"last": "2026-01-01"}, ["2026-01-01"]),
+            ({"first": "2026-02-01"}, ["2026-02-02"]),
+            ({"first": "2026-04-01", "last": "2026-04-02"}, []),
+        ]:
+            with self.subTest(bounds=bounds):
+                tables = self.exported_tables(account_id=aid, period="CUSTOM", **bounds)
+                self.assertEqual([row["Date"] for row in tables["transactions"]], expected)
+        tables = self.exported_tables(account_id=aid, period="2026")
+        self.assertEqual(len(tables["transactions"]), 3)
+
+    def test_finance_export_carries_opening_before_filtering_months_and_yearly_totals(self):
+        self.service.dispatch("settings.save", {"finance": True})
+        cats = self.service.db.list_finance_categories()
+        salary = next(c.id for c in cats if c.kind == "income")
+        rent = next(c.id for c in cats if c.kind == "expense")
+        for month, income, expense in [("2026-01", "1000", "200"), ("2026-02", "500", "300"),
+                                        ("2026-03", "700", "100")]:
+            self.service.dispatch("finance.month.save", {"month": month, "opening": "100" if month.endswith("01") else "",
+                "entries": {str(salary): {"raw": income, "comment": "工资\n第二行"}, str(rent): {"raw": expense}}})
+        tables = self.exported_tables(kind="finance", period="CUSTOM", first="2026-02", last="2026-02")
+        monthly = tables["monthly"]
+        self.assertEqual(len(monthly), 1)
+        self.assertEqual((monthly[0]["Month"], monthly[0]["Opening"], monthly[0]["Ending balance"]),
+                         ("2026-02", "900.00", "1100.00"))
+        year = tables["yearly"][0]
+        self.assertEqual((year["Months"], year["Total income"], year["Total expenses"]), ("1", "500.00", "300.00"))
+        self.assertEqual([row["Month"] for row in tables["entries"]], ["2026-02", "2026-02"])
+        self.assertEqual(tables["entries"][0]["Comment"], "工资\n第二行")
+        with mock.patch("desktop_backend.today", return_value="2026-03-31"):
+            recent = self.exported_tables(kind="finance", period="3M")
+        self.assertEqual([row["Month"] for row in recent["monthly"]], ["2026-01", "2026-02", "2026-03"])
+
+    def test_export_rejects_invalid_ranges_before_writing_and_names_ranges_separately(self):
+        aid = self.account()
+        for params in [
+            {"period": "CUSTOM", "first": "2026-02-30"},
+            {"period": "CUSTOM", "first": "2026-02-01", "last": "2026-01-01"},
+            {"kind": "finance", "period": "CUSTOM", "first": "2026-13"},
+            {"kind": "finance", "period": "CUSTOM", "first": "2026-02", "last": "2026-01"},
+            {"period": "invalid"}, {"kind": "invalid"},
+        ]:
+            with self.subTest(params=params), self.assertRaises(ValueError):
+                self.exported_tables(account_id=aid, **params)
+        self.assertEqual(list(Path(self.folder.name).glob("*.csv")), [])
+        self.exported_tables(account_id=aid, period="2025")
+        self.exported_tables(account_id=aid, period="2026")
+        self.assertEqual(len(list(Path(self.folder.name).glob("*.csv"))), 6)
 
     def test_stdio_protocol_has_no_qt_dependency_and_survives_bad_request(self):
         path = Path(self.folder.name) / "stdio.db"
