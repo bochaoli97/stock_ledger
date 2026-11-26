@@ -32,6 +32,9 @@ def tr(text: str, **values) -> str:
 
 
 ZH: dict[str, str] = {
+    "Salary": "工资",
+    "Housing": "住房",
+    "Food": "餐饮",
     # ---- app, window, top bar
     "Stock Ledger": "股票账本",
     "No account": "没有账户",

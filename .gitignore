@@ -1,6 +1,8 @@
 # Python 字节码和缓存
 __pycache__/
 */__pycache__/*
+.pytest_cache/
+.ruff_cache/
 *.py[cod]
 *$py.class
 
@@ -29,3 +31,12 @@ Thumbs.db
 .env
 
 data/
+
+# React / Electron desktop build and local tooling
+node_modules/
+desktop/out/
+desktop/release/
+desktop/resources/stock-ledger-service*
+desktop/.python-build/
+desktop/test-results/
+desktop/playwright-report/
