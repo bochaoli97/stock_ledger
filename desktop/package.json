@@ -1,0 +1,81 @@
+{
+  "name": "stock-ledger-desktop",
+  "version": "3.0.1",
+  "private": true,
+  "description": "Local stock ledger with compositor-driven numeric reels",
+  "main": "electron/main.mjs",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:web": "vite --host 127.0.0.1",
+    "start": "node scripts/start.mjs",
+    "build": "tsc --noEmit && vite build",
+    "test": "node --import tsx src/ticker/engine.test.ts && node electron/bridge.test.mjs && node electron/data-path.test.mjs && node electron/graphics.test.mjs",
+    "test:browser": "playwright test",
+    "test:package": "node scripts/smoke-package.mjs",
+    "build:python": "python scripts/build-backend.py",
+    "package": "npm run build && npm run build:python && electron-builder",
+    "package:dir": "npm run build && npm run build:python && electron-builder --dir"
+  },
+  "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "electron": "^45.5.0",
+    "electron-builder": "^26.18.0",
+    "prettier": "^3.10.1",
+    "tsx": "^4.0.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  },
+  "build": {
+    "appId": "local.stockledger.desktop",
+    "productName": "Stock Ledger",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "electron/**/*",
+      "!electron/**/*.test.mjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources",
+        "to": "python",
+        "filter": [
+          "stock-ledger-service*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "../icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Finance"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.finance"
+    }
+  }
+}

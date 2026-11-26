@@ -1,1 +1,2 @@
-PyQt6>=6.6,<7
+# The desktop Python service uses only the Python 3.12+ standard library.
+# Development tests: requirements-dev.txt; packaging: desktop/requirements-build.txt.
