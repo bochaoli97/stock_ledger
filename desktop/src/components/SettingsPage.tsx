@@ -3,12 +3,13 @@ import packageInfo from "../../package.json";
 import {
   api,
   type Account,
+  type GoogleDriveStatus,
   type RuntimeInfo,
   type Settings,
   type Snapshot,
 } from "../types";
 import { useT } from "../i18n";
-import { Icon } from "./common";
+import { errorText, Icon } from "./common";
 
 function SettingsCard({
   icon,
@@ -35,6 +36,116 @@ function SettingsCard({
         </div>
       </div>
       {children}
+    </section>
+  );
+}
+
+async function readGoogleDriveStatus(): Promise<GoogleDriveStatus | null> {
+  try {
+    return await api().googleDriveStatus();
+  } catch {
+    return null;
+  }
+}
+
+function GoogleDriveBackup({
+  report,
+  onNotice,
+}: {
+  report(error: unknown): void;
+  onNotice(message: string): void;
+}) {
+  const t = useT();
+  const [status, setStatus] = useState<GoogleDriveStatus | "loading" | null>(
+    "loading",
+  );
+  const [operation, setOperation] = useState<"backup" | "disconnect" | null>(
+    null,
+  );
+  const connection = status === "loading" ? null : status;
+  const disabled = status === "loading" || operation !== null;
+  useEffect(() => {
+    let mounted = true;
+    void readGoogleDriveStatus().then((result) => {
+      if (mounted) setStatus(result);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const run = async (action: "backup" | "disconnect") => {
+    setOperation(action);
+    try {
+      if (action === "backup") {
+        const result = await api().googleDriveBackup();
+        if (result) {
+          onNotice(
+            `${t("Google Drive backup complete")} · ${result.folderName} / ${result.name}`,
+          );
+        }
+      } else {
+        await api().googleDriveDisconnect();
+      }
+    } catch (error) {
+      report(t(errorText(error)));
+    } finally {
+      setStatus(await readGoogleDriveStatus());
+      setOperation(null);
+    }
+  };
+
+  let statusMessage =
+    "Choose a Google Cloud Desktop app OAuth JSON file to get started.";
+  if (operation === "backup") {
+    statusMessage = connection?.connected
+      ? "Backing up to Google Drive…"
+      : "Follow the prompts and complete Google sign-in in your browser.";
+  } else if (operation === "disconnect") {
+    statusMessage = "Clearing Google Drive setup…";
+  } else if (status === "loading") {
+    statusMessage = "Checking Google Drive connection…";
+  } else if (!connection) {
+    statusMessage = "Google Drive connection status is unavailable.";
+  } else if (connection.connected) {
+    statusMessage = connection.savedSignIn
+      ? "Google Drive connected"
+      : "Google Drive connected for this session";
+  } else if (connection.configured) {
+    statusMessage = "Sign in to Google in your browser to connect.";
+  }
+
+  return (
+    <section className="settings-cloud-backup" aria-label="Google Drive">
+      <h3>Google Drive</h3>
+      <p className="settings-note">
+        {t("Save a dated database backup in the Stock Ledger Backups folder.")}
+      </p>
+      <p className="settings-note" role="status">
+        {t(statusMessage)}
+      </p>
+      <div className="settings-buttons">
+        <button
+          className="button secondary"
+          disabled={disabled}
+          onClick={() => void run("backup")}
+        >
+          {t("Back up to Google Drive")}
+        </button>
+        {(connection?.configured || connection?.connected) && (
+          <button
+            className="button secondary"
+            disabled={disabled}
+            onClick={() => void run("disconnect")}
+          >
+            {t(
+              connection.connected
+                ? "Disconnect Google Drive"
+                : "Reset Google Drive setup",
+            )}
+          </button>
+        )}
+      </div>
     </section>
   );
 }
@@ -245,7 +356,7 @@ export function SettingsPage({
         <SettingsCard
           icon="database"
           title={t("Local data")}
-          description={t("Your ledger stays on this computer.")}
+          description={t("Manage your database and backups.")}
         >
           <p className="settings-note">
             {t(
@@ -274,6 +385,7 @@ export function SettingsPage({
               {runtime.database}
             </p>
           )}
+          <GoogleDriveBackup onNotice={onNotice} report={report} />
           <p className="settings-note settings-export-note">
             {t("Export CSV by date from your account or Finance page.")}
           </p>

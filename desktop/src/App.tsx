@@ -57,6 +57,22 @@ export default function App() {
 }
 
 type Page = "overview" | "activity" | "finance" | "settings" | "studio";
+const commonChartRanges = {
+  "1D": "Today",
+  "1W": "Past week",
+  "1M": "Past month",
+  "3M": "Past 3 months",
+  YTD: "Year to date",
+  "1Y": "Past year",
+};
+const accountChartRanges = { ...commonChartRanges, ALL: "All time" };
+const stockChartRanges = {
+  ...commonChartRanges,
+  "5Y": "Past 5 years",
+  "10Y": "Past 10 years",
+  ALL: "All time",
+};
+
 type Editor =
   | { kind: "account"; initial?: Account }
   | { kind: "transaction"; initial?: Transaction; symbol?: string }
@@ -65,7 +81,11 @@ function LedgerApp({ initial }: { initial: Snapshot }) {
   const [data, setData] = useState(initial),
     [page, setPage] = useState<Page>("overview");
   const [symbol, setSymbol] = useState<string | null>(null),
-    [range, setRange] = useState("1D");
+    [selectedRange, setRange] = useState("1D");
+  const rangeLabels = symbol ? stockChartRanges : accountChartRanges;
+  const range = Object.hasOwn(rangeLabels, selectedRange)
+    ? selectedRange
+    : "1D";
   const [chart, setChart] = useState<ChartData | null>(null),
     [chartLoading, setChartLoading] = useState(false);
   const [editor, setEditor] = useState<Editor | null>(null),
@@ -380,6 +400,7 @@ function LedgerApp({ initial }: { initial: Snapshot }) {
               value={symbol ? (holding?.price ?? "-") : data.summary.total}
               data={chart}
               range={range}
+              rangeLabels={rangeLabels}
               onRange={setRange}
               neutral={neutral}
               loading={chartLoading}
@@ -736,6 +757,7 @@ function Hero({
   value,
   data,
   range,
+  rangeLabels,
   onRange,
   neutral,
   loading,
@@ -744,6 +766,7 @@ function Hero({
   value: string;
   data: ChartData | null;
   range: string;
+  rangeLabels: Record<string, string>;
   onRange(value: string): void;
   neutral: string;
   loading: boolean;
@@ -756,15 +779,6 @@ function Hero({
     hovered = useRef<number | null>(null);
   const latest = useRef({ value, data, range });
   latest.current = { value, data, range };
-  const labels: Record<string, string> = {
-    "1D": "Today",
-    "1W": "Past week",
-    "1M": "Past month",
-    "3M": "Past 3 months",
-    YTD: "Year to date",
-    "1Y": "Past year",
-    ALL: "All time",
-  };
   const update = useCallback(
     (point: ChartPoint | null, index: number | null = null) => {
       hovered.current = point === null ? null : index;
@@ -777,9 +791,9 @@ function Hero({
         change.current.className = delta.startsWith("-") ? "loss" : "gain";
       }
       if (period.current)
-        period.current.textContent = point ? "" : t(labels[now.range]);
+        period.current.textContent = point ? "" : t(rangeLabels[now.range]);
     },
-    [t],
+    [t, rangeLabels],
   );
   useEffect(() => {
     const index = hovered.current;
@@ -804,10 +818,11 @@ function Hero({
         data={data}
         color={resolvedColor}
         onHover={update}
+        intraday={range === "1D" || range === "1W"}
         loading={loading}
       />
       <div className="range-tabs" role="group" aria-label={t("Performance")}>
-        {Object.keys(labels).map((key) => (
+        {Object.keys(rangeLabels).map((key) => (
           <button
             key={key}
             aria-pressed={range === key}
@@ -817,7 +832,7 @@ function Hero({
               onRange(key);
             }}
           >
-            {key === "ALL" ? t("All") : key}
+            {t(key === "ALL" ? "All" : key)}
           </button>
         ))}
       </div>

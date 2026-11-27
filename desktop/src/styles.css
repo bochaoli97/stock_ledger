@@ -386,6 +386,9 @@ svg {
   color: var(--muted);
   font-size: 0.8rem;
 }
+.chart-message-single {
+  align-items: end;
+}
 .chart-cursor {
   position: absolute;
   top: 34px;
@@ -451,6 +454,7 @@ svg {
 }
 .range-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 1.6rem;
   border-bottom: 1px solid var(--border);
   padding-bottom: 1.3rem;
@@ -972,6 +976,15 @@ input[type="checkbox"] {
   margin-top: 1rem;
   font-size: 0.68rem;
   color: var(--muted);
+}
+.settings-cloud-backup {
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--border);
+}
+.settings-cloud-backup h3 {
+  margin: 0 0 0.2rem;
+  font-size: 0.85rem;
 }
 .settings-export-note {
   margin-top: 1rem;

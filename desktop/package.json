@@ -10,7 +10,7 @@
     "dev:web": "vite --host 127.0.0.1",
     "start": "node scripts/start.mjs",
     "build": "tsc --noEmit && vite build",
-    "test": "node --import tsx src/ticker/engine.test.ts && node electron/bridge.test.mjs && node electron/data-path.test.mjs && node electron/graphics.test.mjs",
+    "test": "node --import tsx src/ticker/engine.test.ts && node --test \"electron/*.test.mjs\"",
     "test:browser": "playwright test",
     "test:package": "node scripts/smoke-package.mjs",
     "build:python": "python scripts/build-backend.py",

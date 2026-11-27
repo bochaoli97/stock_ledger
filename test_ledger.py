@@ -18,6 +18,8 @@ from decimal import Decimal as D
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlsplit
 
 from csv_export import (
     ENTRY_HEADERS,
@@ -75,10 +77,13 @@ from ledger import (
     value_series,
 )
 from quotes import (
+    MAX_HISTORY_POINTS,
     Quote,
     QuoteError,
     Suggestion,
+    fetch_full_history,
     fetch_quotes,
+    fetch_stock_history,
     is_crypto,
     is_live,
     ledger_symbol,
@@ -1377,6 +1382,83 @@ def test_fetch_quotes_errors():
         raises(QuoteError, fetch_quotes, ["AAPL"])
     with mock.patch("urllib.request.urlopen", fake_urlopen([])):
         assert fetch_quotes([]) == {}  # nothing to ask for: no request at all
+
+
+def test_full_history_requests_daily_archive_and_preserves_its_endpoints():
+    first = int(utc("1962-01-02 14:30"))
+    stamps = [first + i * 86400 for i in range(2 * MAX_HISTORY_POINTS + 1)]
+    closes = list(range(1, len(stamps) + 1))
+    series = {"meta": {"regularMarketPrice": closes[-1]}, "timestamp": stamps,
+              "indicators": {"quote": [{"close": closes}]}}
+    calls = []
+    with mock.patch("urllib.request.urlopen", fake_urlopen([{"chart": {"result": [series]}}], calls)):
+        points = fetch_full_history("BRK.B")["BRK.B"].points
+    url = urlsplit(calls[0])
+    params = parse_qs(url.query)
+    assert url.path.endswith("/chart/BRK-B") and params["interval"] == ["1d"]
+    assert int(params["period1"][0]) <= first and int(params["period2"][0]) >= stamps[-1]
+    assert int(params["period2"][0]) - int(params["period1"][0]) <= 100 * 365 * 86400
+    assert len(points) == MAX_HISTORY_POINTS and points == sorted(set(points))
+    assert points[0] == (first, closes[0]) and points[-1] == (stamps[-1], closes[-1])
+
+
+def test_full_history_keeps_short_listings_and_handles_missing_symbols():
+    series = {"meta": {"regularMarketPrice": 18}, "timestamp": [100, 200, 300],
+              "indicators": {"quote": [{"close": [17, None, 18]}]}}
+    responses = [{"chart": {"result": [series]}}, {"chart": {"result": None}},
+                 HTTPError("https://example.test", 404, "Unknown symbol", None, None), OSError("offline")]
+    with mock.patch("urllib.request.urlopen", fake_urlopen(responses)):
+        assert fetch_full_history("NEW")["NEW"].points == [(100, 17.), (300, 18.)]
+        assert fetch_full_history("EMPTY") == {} and fetch_full_history("UNKNOWN") == {}
+        raises(QuoteError, fetch_full_history, "NEW", match="offline")
+
+
+def test_full_history_loads_earlier_daily_windows_when_yahoo_reports_an_older_listing():
+    first = int(utc("1920-01-05 15:00"))
+    recent = int(utc("2026-11-25 21:00"))
+    meta = {"regularMarketPrice": 18, "firstTradeDate": first}
+    latest = {"meta": meta, "timestamp": [recent], "indicators": {"quote": [{"close": [18]}]}}
+    older = {"meta": meta, "timestamp": [first], "indicators": {"quote": [{"close": [4]}]}}
+    calls = []
+    with mock.patch("quotes.time.time", return_value=recent + 86400):
+        responses = [{"chart": {"result": [series]}} for series in (latest, older)]
+        with mock.patch("urllib.request.urlopen", fake_urlopen(responses, calls)):
+            assert fetch_full_history("OLD")["OLD"].points == [(first, 4.), (recent, 18.)]
+    current, previous = [parse_qs(urlsplit(url).query) for url in calls]
+    assert previous["period1"] == [str(first)]
+    assert previous["period2"] == current["period1"]
+
+
+def test_stock_history_recovers_sparse_warrant_prices_using_hourly_closes():
+    opening, first_close, market_close, last_close = [
+        int(utc(stamp)) for stamp in ("2026-11-24 16:30", "2026-11-24 20:30",
+                                      "2026-11-25 20:30", "2026-11-25 21:00")
+    ]
+    meta = {"regularMarketPrice": 2.93}
+    daily = {"meta": meta, "timestamp": [last_close], "indicators": {"quote": [{"close": [2.93]}]}}
+    hourly = {"meta": meta, "timestamp": [opening, first_close, market_close],
+              "indicators": {"quote": [{"close": [3.1, 2.95, 2.91]}]}}
+    spark = {"spark": {"result": [{"symbol": "SKYD-WT", "response": [daily]}]}}
+    chart = {"chart": {"result": [hourly]}}
+    for period, interval, primary, close in [
+        ("1mo", "1d", spark, (last_close, 2.93)),
+        ("10y", "1wk", spark, (market_close, 2.91)),
+        ("max", "1d", {"chart": {"result": [daily]}}, (last_close, 2.93)),
+    ]:
+        calls = []
+        with mock.patch("urllib.request.urlopen", fake_urlopen([primary, chart], calls)):
+            quote = fetch_stock_history("SKYD.WT", period, interval)["SKYD.WT"]
+        assert quote.points == [(first_close, 2.95), close]
+        url = urlsplit(calls[1])
+        params = parse_qs(url.query)
+        assert url.path.endswith("/chart/SKYD-WT") and params["interval"] == ["1h"]
+        if period == "1mo":
+            assert params["range"] == ["1mo"]
+        else:
+            assert int(params["period2"][0]) - int(params["period1"][0]) == 729 * 86400
+
+    with mock.patch("urllib.request.urlopen", fake_urlopen([spark, OSError("unavailable")])):
+        assert fetch_stock_history("SKYD.WT", "1mo", "1d")["SKYD.WT"].points == [(last_close, 2.93)]
 
 
 def test_new_york_time():

@@ -28,12 +28,14 @@ from ledger import (PERIODS, TXN_TYPES, TYPE_FIELDS, ZERO, Txn, combine_results,
                     combine_series, fmt_money, fmt_pct, fmt_price, fmt_qty,
                     parse_date, period_range, replay, to_decimal, today,
                     valuation, value_series)
-from quotes import fetch_quotes, is_live, match_local, search_symbols
+from quotes import fetch_quotes, fetch_stock_history, is_live, match_local, search_symbols
 from storage import Storage, daily_backup
 
 ALL_ACCOUNTS = -1
 RANGES = {"1D": ("1d", "5m"), "1W": ("5d", "30m"), "1M": ("1mo", "1d"),
-          "3M": ("3mo", "1d"), "YTD": ("ytd", "1d"), "1Y": ("1y", "1d")}
+          "3M": ("3mo", "1d"), "YTD": ("ytd", "1d"), "1Y": ("1y", "1d"),
+          "ALL": ("max", "1mo")}
+STOCK_RANGES = {**RANGES, "5Y": ("5y", "1wk"), "10Y": ("10y", "1wk"), "ALL": ("max", "1d")}
 
 
 def usd(value, sign=False):
@@ -323,25 +325,28 @@ class LedgerService:
 
     def history_key(self, params):
         aid = self.account_id(params.get("account_id"))
-        result, symbol = self.result(aid), str(params.get("symbol", "")).upper()
+        symbol = str(params.get("symbol", "")).upper()
         rng = params.get("range", "1D")
-        if rng not in {*RANGES, "ALL"}:
+        ranges = STOCK_RANGES if symbol else RANGES
+        if rng not in ranges:
             raise ServiceError("Unknown chart range")
-        if rng == "ALL":
-            first = next((r.txn.date for r in result.rows if not symbol or symbol in (r.txn.symbol, r.txn.symbol2)), today())
+        period, interval = ranges[rng]
+        if symbol:
+            return period, interval, (symbol,)
+
+        result = self.result(aid)
+        if rng == "ALL" and result.rows:
+            first = result.rows[0].txn.date
             days = (date.today() - date.fromisoformat(first)).days
             period, interval = next(((r, i) for d, r, i in
                                      ((90, "3mo", "1d"), (365, "1y", "1d"), (730, "2y", "1d"),
-                                      (1825, "5y", "1wk")) if days <= d), ("max", "1mo"))
-        else:
-            period, interval = RANGES[rng]
-        symbols = (symbol,) if symbol else tuple(sorted(result.positions))
-        return period, interval, symbols
+                                      (1825, "5y", "1wk")) if days <= d), (period, interval))
+        return period, interval, tuple(sorted(result.positions))
 
     def chart(self, params):
         aid = self.account_id(params.get("account_id"))
         symbol, rng = str(params.get("symbol", "")).upper(), params.get("range", "1D")
-        result, prices = self.result(aid), self.prices()
+        prices = self.prices()
         key = self.history_key(params)
         data = self.quotes if rng == "1D" else self.history.get(key, (0, {}))[1]
         baseline, change = None, None
@@ -354,9 +359,10 @@ class LedgerService:
             if rng == "1D" and q:
                 baseline = float(q.prev_close) if q.prev_close else None
                 live = is_live(symbol, q)
-            if points and current is not None:
+            if rng in {"1D", "1W"} and len(points) > 1 and current is not None:
                 points.append((int(time.time()), float(current), 0.))
         else:
+            result = self.result(aid)
             current = result.cash + valuation(result, prices).market_value
             series = {s: q.points for s, q in data.items() if s in result.positions and q.points}
             if self.live and series:
@@ -370,13 +376,15 @@ class LedgerService:
                 day, _ = self.day_change(result)
                 baseline, change = float(current - day), float(day)
                 live = any(q and is_live(p.symbol, q) for p in result.open_positions for q in [self.quotes.get(p.symbol)])
+        has_return = baseline is not None or len(points) > 1
         formatted = []
         for ts, value, net in points:
             base = baseline if baseline is not None else points[0][1] + net - points[0][2]
             delta = value - base
             formatted.append({"time": ts, "value": value, "text": usd(value),
-                              "change": usd(delta, True), "percent": fmt_pct(Decimal(str(delta / base))) if base else ""})
-        if change is None and formatted:
+                              "change": usd(delta, True) if has_return else "",
+                              "percent": fmt_pct(Decimal(str(delta / base))) if has_return and base else ""})
+        if change is None and has_return and points:
             change = points[-1][1] - (baseline if baseline is not None else points[0][1] + points[-1][2] - points[0][2])
         base = baseline if baseline is not None else (points[0][1] + points[-1][2] - points[0][2] if points else 0)
         return {"points": formatted, "baseline": baseline, "slots": 79 if rng == "1D" else 0,
@@ -385,7 +393,8 @@ class LedgerService:
                 "change": usd(change, True) if change is not None else "",
                 "percent": fmt_pct(Decimal(str(change / base))) if change is not None and base else "",
                 "message": i18n.tr("Turn on Live prices to see the chart") if not self.live else
-                           i18n.tr("No chart data") if not points else ""}
+                           i18n.tr("No chart data") if not points else
+                           i18n.tr("Only one price point is available") if len(points) == 1 else ""}
 
     def local_suggestions(self, query):
         result = self.result(ALL_ACCOUNTS)
@@ -422,12 +431,15 @@ class LedgerService:
             return lambda: fetch_quotes(symbols), finish
         if method == "chart" and self.live and params.get("range", "1D") != "1D":
             key = self.history_key(params)
+            period, interval, symbols = key
             fetched, _ = self.history.get(key, (0, None))
-            if time.time() - fetched > 600 and key[2]:
+            if time.time() - fetched > 600 and symbols:
                 def finish(got):
                     self.history[key] = (time.time(), got)
                     return self.chart(params)
-                return lambda: fetch_quotes(key[2], key[0], key[1]), finish
+                if params.get("symbol"):
+                    return lambda: fetch_stock_history(symbols[0], period, interval), finish
+                return lambda: fetch_quotes(symbols, period, interval), finish
         if method == "symbols.search" and self.live and str(params.get("query", "")).strip():
             def finish(got):
                 items = self.local_suggestions(params["query"])

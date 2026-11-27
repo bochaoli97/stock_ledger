@@ -1,8 +1,16 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  safeStorage,
+  shell,
+} from "electron";
 import { accessSync, constants, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PythonBridge } from "./bridge.mjs";
+import { createGoogleDriveBackup, googleDriveVault } from "./cloud-backup.mjs";
 import { preferredDataDirectory } from "./data-path.mjs";
 import { runtimeDiagnostics } from "./graphics.mjs";
 
@@ -133,6 +141,25 @@ function registerIPC() {
       ? null
       : bridge.request("backup", { path: filePath });
   });
+  const cloudBackup = createGoogleDriveBackup({
+    profileDirectory: app.getPath("userData"),
+    tempDirectory: app.getPath("temp"),
+    vault: googleDriveVault(safeStorage),
+    pickClientFile: async () => {
+      const { canceled, filePaths } = await dialog.showOpenDialog(window, {
+        title: "Google OAuth Desktop client / Google 桌面应用授权凭据",
+        properties: ["openFile"],
+        filters: [{ name: "Google OAuth JSON", extensions: ["json"] }],
+      });
+      return canceled ? null : filePaths[0];
+    },
+    openExternal: (url) => shell.openExternal(url),
+    createSnapshot: (snapshotPath) =>
+      bridge.request("backup", { path: snapshotPath }),
+  });
+  handle("ledger:google-drive-status", () => cloudBackup.status());
+  handle("ledger:google-drive-backup", () => cloudBackup.backup());
+  handle("ledger:google-drive-disconnect", () => cloudBackup.disconnect());
   handle("ledger:export", async (kind, accountId, range = {}) => {
     if (!["stock", "finance"].includes(kind))
       throw new Error("Invalid export type");

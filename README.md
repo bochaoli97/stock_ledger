@@ -20,6 +20,14 @@ To use an existing ledger, copy its `data` folder beside the executable. The dat
 - Dark/light themes, English/Chinese, text size, database backups, and actual GPU diagnostics.
 - CSV export on account and Finance pages, with all-time, recent, yearly, and custom date/month ranges. Activity and Finance exports inherit the page's time filter. Opening balances and costs still include earlier history; historical holdings leave unavailable market prices blank.
 
+## Google Drive backup
+
+In **Settings → Local data**, select **Back up to Google Drive**. For the initial setup, use a Google Cloud project with the Google Drive API enabled and create an OAuth client of type **Desktop app**. Configure the Google Auth Platform consent screen and add your Google account as a test user if the app is in Testing. [Drive API setup](https://developers.google.com/workspace/drive/api/quickstart/python) · [Create OAuth credentials](https://developers.google.com/workspace/guides/create-credentials#oauth-client-id)
+
+Select the downloaded OAuth client JSON, sign in on Google's page in your browser, and grant access. Stock Ledger asks for the per-file Drive permission and uploads a consistent SQLite snapshot to the **Stock Ledger Backups** folder in My Drive. Each click creates a new timestamped `.db` file. [Drive access scopes](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)
+
+Subsequent backups use the saved sign-in when protected storage is available on your computer. Google may prompt you to sign in again when authorization expires, including after seven days for external apps in Testing. Keep your OAuth client JSON in a private location. [Google OAuth app publishing status](https://developers.google.com/identity/protocols/oauth2/production-readiness/overview)
+
 ## Development
 
 Requires Node.js 24 LTS and Python 3.12+. The Python runtime uses only the standard library.

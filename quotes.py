@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -22,10 +23,13 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
+CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
 SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search"
 BATCH = 20  # symbols per request
 TIMEOUT = 10  # seconds
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+MAX_HISTORY_POINTS = 1000
+DAILY_HISTORY_WINDOW = 100 * 365 * 86400  # Yahoo allows at most 100 years of daily data per request.
 
 
 @dataclass
@@ -77,25 +81,42 @@ def _dec(value) -> Decimal | None:
     return d if d.is_finite() and d > 0 else None
 
 
+def _fetch_json(url: str, params: dict, *, allow_missing=False) -> dict:
+    req = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}", headers=HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return json.load(resp)
+    except (OSError, ValueError) as e:
+        if allow_missing and isinstance(e, urllib.error.HTTPError) and e.code == 404:
+            return {}
+        raise QuoteError(str(e)) from e
+
+
+def _parse_quote(resp: dict) -> Quote | None:
+    meta = resp.get("meta") or {}
+    price = _dec(meta.get("regularMarketPrice"))
+    if price is None:
+        return None
+    closes = ((resp.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+    points = [(t, float(c)) for t, c in zip(resp.get("timestamp") or [], closes) if c is not None]
+    ts = meta.get("regularMarketTime")
+    return Quote(
+        price=price,
+        prev_close=_dec(meta.get("chartPreviousClose") or meta.get("previousClose")),
+        time=datetime.fromtimestamp(ts) if ts else None,
+        name=meta.get("shortName") or meta.get("longName") or "",
+        points=points,
+    )
+
+
 def parse_spark(data: dict) -> dict[str, Quote]:
     """Turn a spark API response into {yahoo symbol: Quote}."""
     out = {}
     for item in (data.get("spark") or {}).get("result") or []:
         for resp in item.get("response") or []:
-            meta = resp.get("meta") or {}
-            price = _dec(meta.get("regularMarketPrice"))
-            if price is None:
-                continue
-            closes = ((resp.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
-            points = [(t, float(c)) for t, c in zip(resp.get("timestamp") or [], closes) if c is not None]
-            ts = meta.get("regularMarketTime")
-            out[item["symbol"]] = Quote(
-                price=price,
-                prev_close=_dec(meta.get("chartPreviousClose") or meta.get("previousClose")),
-                time=datetime.fromtimestamp(ts) if ts else None,
-                name=meta.get("shortName") or meta.get("longName") or "",
-                points=points,
-            )
+            quote = _parse_quote(resp)
+            if quote is not None:
+                out[item["symbol"]] = quote
     return out
 
 
@@ -109,19 +130,75 @@ def fetch_quotes(symbols, rng: str = "1d", interval: str = "5m") -> dict[str, Qu
     names = sorted(by_yahoo)
     result: dict[str, Quote] = {}
     for i in range(0, len(names), BATCH):
-        query = urllib.parse.urlencode(
-            {"symbols": ",".join(names[i:i + BATCH]), "range": rng, "interval": interval}
-        )
-        req = urllib.request.Request(f"{SPARK_URL}?{query}", headers=HEADERS)
-        try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-                data = json.load(resp)
-        except (OSError, ValueError) as e:
-            raise QuoteError(str(e)) from e
+        data = _fetch_json(SPARK_URL, {"symbols": ",".join(names[i:i + BATCH]), "range": rng, "interval": interval})
         for ysym, quote in parse_spark(data).items():
             if ysym in by_yahoo:
                 result[by_yahoo[ysym]] = quote
     return result
+
+
+def _fetch_chart(symbol: str, **params) -> dict:
+    path = urllib.parse.quote(yahoo_symbol(symbol), safe="")
+    data = _fetch_json(f"{CHART_URL}/{path}", params, allow_missing=True)
+    series = (data.get("chart") or {}).get("result") or []
+    return series[0] if series else {}
+
+
+def fetch_full_history(symbol: str) -> dict[str, Quote]:
+    """Fetch the stock's daily archive and keep evenly spaced closes, including both endpoints."""
+    # Yahoo's range=max can omit years of early daily history because it returns coarser bars.
+    end = int(time.time())
+    start = end - DAILY_HISTORY_WINDOW
+    params = {"interval": "1d", "includeAdjustedClose": "false"}
+    series = _fetch_chart(symbol, period1=start, period2=end, **params)
+    quote = _parse_quote(series)
+    if quote is None:
+        return {}
+
+    first_trade = series["meta"].get("firstTradeDate")
+    while first_trade is not None and first_trade < start:
+        end, start = start, max(first_trade, start - DAILY_HISTORY_WINDOW)
+        older = _parse_quote(_fetch_chart(symbol, period1=start, period2=end, **params))
+        if older is not None:
+            quote.points = sorted(dict(older.points + quote.points).items())
+
+    if len(quote.points) > MAX_HISTORY_POINTS:
+        last = len(quote.points) - 1
+        quote.points = [quote.points[i * last // (MAX_HISTORY_POINTS - 1)] for i in range(MAX_HISTORY_POINTS)]
+    return {symbol: quote}
+
+
+def fetch_stock_history(symbol: str, period: str, interval: str) -> dict[str, Quote]:
+    """Fill sparse daily or weekly charts from the last hourly close of each trading day."""
+    history = fetch_full_history(symbol) if period == "max" else fetch_quotes((symbol,), period, interval)
+    quote = history.get(symbol)
+    if quote is None or len(quote.points) > 1 or interval not in {"1d", "1wk"}:
+        return history
+
+    # Yahoo's hourly archive covers up to two years. Shorter ranges still use their requested bounds.
+    if period in {"1mo", "3mo", "ytd", "1y"}:
+        bounds = {"range": period}
+    else:
+        end = int(time.time())
+        bounds = {"period1": end - 729 * 86400, "period2": end}
+    try:
+        recent = _parse_quote(_fetch_chart(symbol, interval="1h", includePrePost="false", **bounds))
+    except QuoteError:
+        return history
+    if recent is None:
+        return history
+
+    def session_day(timestamp):
+        if is_crypto(symbol):
+            return datetime.fromtimestamp(timestamp, timezone.utc).date()
+        return new_york_time(timestamp).date()
+
+    daily = {session_day(t): (t, close) for t, close in recent.points}
+    if interval == "1d":
+        daily.update({session_day(t): (t, close) for t, close in quote.points})
+    if len(daily) > len(quote.points):
+        quote.points = sorted(daily.values())
+    return history
 
 
 # ----------------------------------------------------------------------
@@ -226,15 +303,8 @@ def search_symbols(query: str, limit: int = 8) -> list[Suggestion]:
     query = query.strip()
     if not query:
         return []
-    params = urllib.parse.urlencode(
-        {"q": query, "quotesCount": limit + 4, "newsCount": 0, "listsCount": 0, "enableFuzzyQuery": "false"}
-    )  # a few extra, since non-US listings are dropped
-    req = urllib.request.Request(f"{SEARCH_URL}?{params}", headers=HEADERS)
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            data = json.load(resp)
-    except (OSError, ValueError) as e:
-        raise QuoteError(str(e)) from e
+    data = _fetch_json(SEARCH_URL, {"q": query, "quotesCount": limit + 4, "newsCount": 0,
+                                    "listsCount": 0, "enableFuzzyQuery": "false"})
     return parse_search(data)[:limit]
 
 

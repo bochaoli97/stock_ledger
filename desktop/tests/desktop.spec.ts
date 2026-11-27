@@ -54,7 +54,7 @@ s.close()
   // The production entry point and interpreter remain exactly the same.
   await writeFile(
     path.join(temporary, "sitecustomize.py"),
-    `import runpy, sys\nsys.path.insert(0, ${JSON.stringify(path.dirname(directory))})\nimport quotes\nfixture = runpy.run_path(${JSON.stringify(path.join(directory, "tests/fixture-service.py"))})\nquotes.fetch_quotes = fixture["fetch"]\nquotes.search_symbols = fixture["search"]\n`,
+    `import runpy, sys\nsys.path.insert(0, ${JSON.stringify(path.dirname(directory))})\nimport quotes\nfixture = runpy.run_path(${JSON.stringify(path.join(directory, "tests/fixture-service.py"))})\nquotes.fetch_quotes = fixture["fetch"]\nquotes.fetch_full_history = lambda symbol: fixture["fetch"]([symbol], "max", "1d")\nquotes._fetch_chart = lambda *args, **kwargs: {}\nquotes.search_symbols = fixture["search"]\n`,
     "utf8",
   );
   const environment: Record<string, string> = {
@@ -195,6 +195,182 @@ test("real chart hover, restore and range requests stay in the renderer", async 
     path: test.info().outputPath("portfolio-dark.png"),
     fullPage: true,
   });
+});
+
+test("individual stocks show long market history before the first purchase", async () => {
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByLabel("Live prices").check();
+  await page.getByLabel("Language", { exact: true }).selectOption("zh");
+  await page.getByRole("button", { name: "投资", exact: true }).click();
+  const tabs = page.getByRole("group", { name: "投资表现" });
+  await expect(tabs.getByRole("button", { name: "5年" })).toHaveCount(0);
+  await page.locator(".stock-row").filter({ hasText: "AAPL" }).click();
+  const chart = page.locator(".price-chart");
+  for (const [name, caption, years] of [
+    ["5年", "过去五年", 5],
+    ["全部", "全部时间", 40],
+    ["10年", "过去十年", 10],
+  ] as const) {
+    const tab = tabs.getByRole("button", { name, exact: true });
+    await tab.click();
+    await expect(tab).toHaveAttribute("aria-pressed", "true");
+    await expect(page.locator(".hero-change")).toContainText(caption);
+    await expect(chart).toHaveAttribute("aria-busy", "false");
+    await chart.hover({ position: { x: 3, y: 50 } });
+    const start = new Date(Date.now() - years * 365 * 86400 * 1000);
+    await expect(chart.locator(".chart-cursor > span")).toContainText(
+      String(start.getUTCFullYear()),
+    );
+  }
+  await page.keyboard.press("Escape");
+  await expect(tabs.getByRole("button", { name: "1天" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await expect(tabs.getByRole("button", { name: "10年" })).toHaveCount(0);
+});
+
+test("a stock with one historical price shows a point that can be inspected", async () => {
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByLabel("Live prices").check();
+  await page.getByRole("button", { name: "Investing", exact: true }).click();
+  await page.locator(".stock-row").filter({ hasText: "MSFT" }).click();
+  await page.getByRole("button", { name: "1Y", exact: true }).click();
+
+  const chart = page.getByRole("group", { name: "Price history / 价格走势" });
+  const ticker = page.locator(".hero .number-ticker");
+  await expect(chart).toContainText("Only one price point is available");
+  await expect(ticker).toHaveAttribute("aria-label", "$420.50");
+  await chart.press("ArrowLeft");
+  await expect(chart.locator(".chart-cursor")).toBeVisible();
+  await expect(ticker).toHaveAttribute("aria-label", "$419.50");
+
+  await page.getByRole("button", { name: "1Y", exact: true }).focus();
+  await expect(chart.locator(".chart-cursor")).toBeHidden();
+  await chart.hover();
+  await expect(chart.locator(".chart-cursor")).toBeVisible();
+  await expect(ticker).toHaveAttribute("aria-label", "$419.50");
+});
+
+test("Google Drive backup authorizes in the browser and uploads a consistent SQLite file", async () => {
+  await app.evaluate(({ dialog }) => {
+    dialog.showOpenDialog = async () => ({ canceled: true, filePaths: [] });
+  });
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  const drive = page.getByRole("region", { name: "Google Drive", exact: true });
+  const backup = drive.getByRole("button", { name: "Back up to Google Drive" });
+  await backup.click();
+  await expect(backup).toBeEnabled();
+  await expect(drive).toContainText(
+    "Choose a Google Cloud Desktop app OAuth JSON file",
+  );
+
+  const credentials = path.join(temporary, "client.json");
+  const uploaded = path.join(temporary, "uploaded.db");
+  await writeFile(
+    credentials,
+    JSON.stringify({
+      installed: {
+        client_id: "fixture.apps.googleusercontent.com",
+        client_secret: "fixture-client-credential",
+      },
+    }),
+  );
+  await app.evaluate(
+    ({ dialog, shell }, { credentials, uploaded }) => {
+      dialog.showOpenDialog = async () => ({
+        canceled: false,
+        filePaths: [credentials],
+      });
+      const localFetch = globalThis.fetch;
+      shell.openExternal = async (url) => {
+        const auth = new URL(url);
+        if (auth.origin !== "https://accounts.google.com")
+          throw new Error("Unexpected sign-in origin");
+        const callback = new URL(auth.searchParams.get("redirect_uri")!);
+        callback.searchParams.set("state", auth.searchParams.get("state")!);
+        callback.searchParams.set("code", "test-code");
+        const response = await localFetch(callback);
+        if (!response.ok) throw new Error("Loopback validation failed");
+        await response.text();
+      };
+      let name: string;
+      globalThis.fetch = async (input, options) => {
+        const url = new URL(String(input));
+        if (url.href === "https://oauth2.googleapis.com/token") {
+          const grant = options?.body as URLSearchParams;
+          if (grant.get("code") !== "test-code" || !grant.get("code_verifier"))
+            throw new Error("Expected OAuth code exchange with PKCE");
+          return Response.json({
+            access_token: "fixture-access",
+            refresh_token: "fixture-refresh",
+            expires_in: 3600,
+            scope: "https://www.googleapis.com/auth/drive.file",
+          });
+        }
+        const headers = new Headers(options?.headers);
+        if (
+          url.origin !== "https://www.googleapis.com" ||
+          headers.get("Authorization") !== "Bearer fixture-access"
+        )
+          throw new Error("Unexpected Google API request");
+        if (url.pathname === "/drive/v3/files" && !options?.method)
+          return Response.json({
+            files: [
+              { id: "folder", name: "Stock Ledger Backups", shared: false },
+            ],
+          });
+        if (
+          url.pathname === "/upload/drive/v3/files" &&
+          options?.method === "POST"
+        ) {
+          const file = JSON.parse(String(options.body));
+          if (file.parents?.[0] !== "folder")
+            throw new Error("Unexpected Drive folder");
+          name = file.name;
+          return new Response(null, {
+            headers: {
+              Location: `${url.origin}${url.pathname}?upload_id=session`,
+            },
+          });
+        }
+        if (
+          url.searchParams.get("upload_id") === "session" &&
+          options?.method === "PUT"
+        ) {
+          const chunks = [];
+          for await (const chunk of options.body as unknown as AsyncIterable<Uint8Array>)
+            chunks.push(chunk);
+          const fs = process.getBuiltinModule("node:fs/promises")!;
+          await fs.writeFile(uploaded, Buffer.concat(chunks));
+          return Response.json({ id: "backup", name }, { status: 201 });
+        }
+        throw new Error("Unexpected Drive request");
+      };
+    },
+    { credentials, uploaded },
+  );
+  await backup.click();
+  await expect(page.locator(".notice-banner")).toHaveText(
+    /Google Drive backup complete · Stock Ledger Backups \/ stock_ledger_.*\.db/,
+  );
+  const python =
+    process.env.STOCK_LEDGER_TEST_PYTHON ||
+    (process.platform === "win32" ? "python" : "python3");
+  const result = execFileSync(
+    python,
+    [
+      "-c",
+      "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute('PRAGMA integrity_check').fetchone()[0]); print(db.execute('SELECT name FROM accounts ORDER BY id LIMIT 1').fetchone()[0])",
+      uploaded,
+    ],
+    { encoding: "utf8" },
+  );
+  expect(result.replaceAll("\r\n", "\n")).toBe("ok\nBrokerage\n");
+  await drive.getByRole("button", { name: "Disconnect Google Drive" }).click();
+  await expect(drive).toContainText(
+    "Choose a Google Cloud Desktop app OAuth JSON file",
+  );
 });
 
 test("animation compositor, fractional retargeting, clipping and frame timing", async () => {

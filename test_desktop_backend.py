@@ -121,6 +121,43 @@ class DesktopServiceTests(unittest.TestCase):
         self.assertEqual(result["points"][1]["text"], "$1,204.00")
         self.assertEqual(result["change"], "+$4.00")
 
+    def test_stock_chart_fetches_long_history_for_a_new_position(self):
+        now = datetime.now()
+        aid = self.account(date=now.date().isoformat(), positions=[{"symbol": "AAPL", "quantity": "1", "price": "100"}])
+        self.service.dispatch("settings.save", {"live": True})
+        last = int(now.timestamp())
+        with mock.patch("desktop_backend.fetch_stock_history") as loader:
+            for code, years, period, interval in (("5Y", 5, "5y", "1wk"),
+                                                   ("10Y", 10, "10y", "1wk"),
+                                                   ("ALL", 40, "max", "1d")):
+                with self.subTest(code=code):
+                    params = {"account_id": aid, "symbol": "aapl", "range": code}
+                    first = last - years * 365 * 86400
+                    loader.return_value = {"AAPL": Quote(D("100"), None, now, points=[(first, 40.), (last, 100.)])}
+                    job, finish = self.service.prepare_network("chart", params)
+                    chart = finish(job())
+                    loader.assert_called_with("AAPL", period, interval)
+                    self.assertEqual(chart["points"][0]["time"], first)
+                    self.assertEqual(chart["change"], "+$60.00")
+                    self.assertIsNone(self.service.prepare_network("chart", params))
+
+        self.assertEqual(self.service.history_key({"account_id": aid, "range": "ALL"}), ("3mo", "1d", ("AAPL",)))
+
+    def test_stock_chart_does_not_extend_a_single_close_with_the_stored_price(self):
+        aid = self.account(positions=[{"symbol": "SKYD.WT", "quantity": "1", "price": "3"}])
+        self.service.dispatch("settings.save", {"live": True})
+        self.service.dispatch("prices.save", {"prices": {"SKYD.WT": "3.50"}})
+        params = {"account_id": aid, "symbol": "SKYD.WT", "range": "1M"}
+        close = int(datetime(2026, 11, 25, 21, tzinfo=timezone.utc).timestamp())
+        quote = Quote(D("2.93"), None, None, points=[(close, 2.93)])
+        with mock.patch("desktop_backend.fetch_stock_history", return_value={"SKYD.WT": quote}):
+            job, finish = self.service.prepare_network("chart", params)
+            chart = finish(job())
+        self.assertEqual(chart["value"], "$3.50")
+        self.assertEqual(chart["points"], [{"time": close, "value": 2.93, "text": "$2.93", "change": "", "percent": ""}])
+        self.assertEqual(chart["change"], "")
+        self.assertEqual(chart["message"], "Only one price point is available")
+
     def test_export_backup_and_finance_toggle_preserve_data(self):
         aid = self.account()
         exported = self.service.dispatch("export", {"folder": self.folder.name, "account_id": aid})
