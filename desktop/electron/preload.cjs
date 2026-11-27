@@ -8,6 +8,9 @@ async function invoke(channel, ...args) {
 contextBridge.exposeInMainWorld("ledger", {
   request: (method, params = {}) => invoke("ledger:request", method, params),
   backup: () => invoke("ledger:backup"),
+  googleDriveStatus: () => invoke("ledger:google-drive-status"),
+  googleDriveBackup: () => invoke("ledger:google-drive-backup"),
+  googleDriveDisconnect: () => invoke("ledger:google-drive-disconnect"),
   exportCsv: (kind, accountId, range = {}) =>
     invoke("ledger:export", kind, accountId, range),
   openDataFolder: () => invoke("ledger:open-data"),

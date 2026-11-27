@@ -147,12 +147,25 @@ export type RuntimeInfo = {
     devices: { name: string; active: boolean }[];
   };
 };
+export type GoogleDriveStatus = {
+  configured: boolean;
+  connected: boolean;
+  savedSignIn: boolean;
+};
+export type GoogleDriveBackup = {
+  name: string;
+  folderName: string;
+  url: string;
+};
 export type LedgerAPI = {
   request<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
   ): Promise<T>;
   backup(): Promise<string | null>;
+  googleDriveStatus(): Promise<GoogleDriveStatus>;
+  googleDriveBackup(): Promise<GoogleDriveBackup | null>;
+  googleDriveDisconnect(): Promise<void>;
   exportCsv(
     kind: "stock" | "finance",
     accountId: number | null,

@@ -5,11 +5,13 @@ export function PriceChart({
   data,
   color,
   onHover,
+  intraday,
   loading = false,
 }: {
   data: ChartData | null;
   color: string;
   onHover(point: ChartPoint | null, index?: number | null): void;
+  intraday: boolean;
   loading?: boolean;
 }) {
   const host = useRef<HTMLDivElement>(null),
@@ -17,10 +19,11 @@ export function PriceChart({
   const cursor = useRef<HTMLDivElement>(null),
     label = useRef<HTMLSpanElement>(null),
     dot = useRef<HTMLDivElement>(null);
-  const current = useRef({ data, onHover });
-  current.current = { data, onHover };
+  const current = useRef({ data, onHover, intraday });
+  current.current = { data, onHover, intraday };
   const geometry = useRef<{ x: number; y: number }[]>([]);
   const index = useRef<number | null>(null);
+  const pointCount = data?.points.length ?? 0;
   useLayoutEffect(() => {
     const container = host.current!,
       surface = canvas.current!;
@@ -34,7 +37,7 @@ export function PriceChart({
       ctx.clearRect(0, 0, rect.width, rect.height);
       const points = data?.points ?? [];
       geometry.current = [];
-      if (points.length < 2) return;
+      if (!points.length) return;
       let min = Infinity,
         max = -Infinity;
       points.forEach((p) => {
@@ -54,7 +57,10 @@ export function PriceChart({
         bottom = 22;
       // Today's graph reserves the regular-session slots, matching the Qt chart.
       const slots = Math.max(data?.slots ?? 0, points.length);
-      const x = (i: number) => pad + (i / (slots - 1)) * (rect.width - 2 * pad);
+      const x = (i: number) =>
+        slots === 1
+          ? rect.width / 2
+          : pad + (i / (slots - 1)) * (rect.width - 2 * pad);
       const y = (v: number) =>
         top + ((max - v) / (max - min)) * (rect.height - top - bottom);
       if (data?.baseline != null) {
@@ -75,15 +81,21 @@ export function PriceChart({
         cursor.current!.style.setProperty("--cursor-y", `${xy.y}px`);
       }
       ctx.beginPath();
-      geometry.current.forEach((p, i) =>
-        i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y),
-      );
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
-      ctx.lineJoin = "round";
-      ctx.lineCap = "round";
-      ctx.stroke();
       const last = geometry.current.at(-1)!;
+      if (points.length === 1) {
+        ctx.arc(last.x, last.y, 3, 0, 2 * Math.PI);
+        ctx.fillStyle = color;
+        ctx.fill();
+      } else {
+        geometry.current.forEach((p, i) =>
+          i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y),
+        );
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        ctx.stroke();
+      }
       dot.current!.style.transform = `translate3d(${last.x}px,${last.y}px,0)`;
       dot.current!.style.color = color;
     };
@@ -111,7 +123,19 @@ export function PriceChart({
       const date = new Date(p.time * 1000);
       label.current!.textContent = date.toLocaleString(
         document.documentElement.lang,
-        { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" },
+        current.current.intraday
+          ? {
+              month: "short",
+              day: "numeric",
+              hour: "2-digit",
+              minute: "2-digit",
+            }
+          : {
+              year: "numeric",
+              month: "short",
+              day: "numeric",
+              timeZone: "UTC",
+            },
       );
       label.current!.style.transform = `translateX(${Math.min(0, Math.max(-110, node.clientWidth - xy.x - 150))}px)`;
       node.classList.add("chart-scrubbing");
@@ -122,7 +146,11 @@ export function PriceChart({
     };
     const move = (event: PointerEvent) => {
       const positions = geometry.current;
-      if (positions.length < 2) return;
+      if (!positions.length) return;
+      if (positions.length === 1) {
+        select(0);
+        return;
+      }
       const x = event.clientX - node.getBoundingClientRect().left;
       const dx = positions[1].x - positions[0].x;
       select(
@@ -174,7 +202,7 @@ export function PriceChart({
       <div
         ref={dot}
         className={`chart-live-dot ${data?.live ? "" : "no-pulse"}`}
-        hidden={!data?.live || (data?.points.length ?? 0) < 2}
+        hidden={!data?.live || pointCount < 2}
       >
         <i />
         <b />
@@ -183,8 +211,14 @@ export function PriceChart({
         <span ref={label} />
         <i />
       </div>
-      {(data?.points.length ?? 0) < 2 && (
-        <div className="chart-message">
+      {pointCount < 2 && (
+        <div
+          className={
+            !loading && pointCount === 1
+              ? "chart-message chart-message-single"
+              : "chart-message"
+          }
+        >
           {loading
             ? document.documentElement.lang === "zh-CN"
               ? "加载中…"

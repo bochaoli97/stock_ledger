@@ -36,6 +36,10 @@ const extra: Record<string, string> = {
   "Past 3 months": "过去三个月",
   "Year to date": "今年",
   "Past year": "过去一年",
+  "Past 5 years": "过去五年",
+  "Past 10 years": "过去十年",
+  "5Y": "5年",
+  "10Y": "10年",
   "All time": "全部时间",
   "Chart unavailable": "暂无走势图",
   Retry: "重试",
@@ -106,6 +110,49 @@ const extra: Record<string, string> = {
   "Export account CSV": "导出账户 CSV",
   "Export finance CSV": "导出财务收支 CSV",
   "Back up database": "备份数据库",
+  "Back up to Google Drive": "备份到 Google Drive",
+  "Google Drive backup complete": "Google Drive 备份完成",
+  "Choose a Google Cloud Desktop app OAuth JSON file to get started.":
+    "首次备份需选择 Google Cloud 生成的桌面应用 OAuth JSON 文件。",
+  "Save a dated database backup in the Stock Ledger Backups folder.":
+    "将带日期的数据库备份保存到 Stock Ledger Backups 文件夹。",
+  "Follow the prompts and complete Google sign-in in your browser.":
+    "请按提示操作，并在浏览器中完成 Google 登录。",
+  "Sign in to Google in your browser to connect.":
+    "请在浏览器中登录 Google 以连接云端备份。",
+  "Google Drive connected": "已连接 Google Drive",
+  "Google Drive connected for this session": "本次使用期间已连接 Google Drive",
+  "Checking Google Drive connection…": "正在检查 Google Drive 连接…",
+  "Google Drive connection status is unavailable.":
+    "无法获取 Google Drive 连接状态。",
+  "Backing up to Google Drive…": "正在备份到 Google Drive…",
+  "Clearing Google Drive setup…": "正在清除 Google Drive 设置…",
+  "Disconnect Google Drive": "断开 Google Drive 连接",
+  "Reset Google Drive setup": "重置 Google Drive 设置",
+  "Select a Google OAuth Desktop app JSON file.":
+    "请选择 Google OAuth 桌面应用 JSON 文件。",
+  "Could not open Google sign-in.": "无法打开 Google 登录页面。",
+  "Google sign-in timed out. Try again.": "Google 登录已超时，请重试。",
+  "Google Drive access was not granted.": "未获得 Google Drive 访问授权。",
+  "Google sign-in is unavailable. Try again.":
+    "Google 登录暂时不可用，请重试。",
+  "Google rejected this OAuth client. Import a valid Desktop app credential.":
+    "Google 拒绝了此 OAuth 客户端，请导入有效的桌面应用凭据。",
+  "Google authorization expired. Connect again.":
+    "Google 授权已过期，请重新连接。",
+  "Google did not return offline access. Connect again.":
+    "Google 未授予持续访问权限，请重新连接。",
+  "Could not reach Google Drive. Try again.": "无法连接 Google Drive，请重试。",
+  "Google Drive backup failed. Try again.": "Google Drive 备份失败，请重试。",
+  "Could not read the local database backup.": "无法读取本地数据库备份。",
+  "Could not read the Google OAuth client file.":
+    "无法读取 Google OAuth 客户端文件。",
+  "Could not save Google Drive setup.": "无法保存 Google Drive 设置。",
+  "A Google Drive operation is already in progress.":
+    "Google Drive 正在处理上一次操作。",
+  "Could not create the local database backup.": "无法创建本地数据库备份。",
+  "Could not reset Google Drive setup.": "无法重置 Google Drive 设置。",
+  "Could not remove the temporary database backup.": "无法清除临时数据库备份。",
   "Open data folder": "打开数据目录",
   About: "关于",
   "Animation studio": "动画测试",
@@ -187,7 +234,7 @@ const extra: Record<string, string> = {
   "Manage your accounts and opening balances.": "管理投资账户与期初余额。",
   "No accounts yet": "还没有账户，可以先新建一个。",
   "Stock account": "股票账户",
-  "Your ledger stays on this computer.": "账本数据保存在你的电脑上。",
+  "Manage your database and backups.": "管理数据库和备份。",
   "Back up the entire ledger, including accounts, finance and preferences.":
     "完整备份账户、财务收支和偏好设置。",
   "Export CSV by date from your account or Finance page.":

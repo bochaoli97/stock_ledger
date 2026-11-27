@@ -23,6 +23,14 @@
 
 账户 CSV 包括交易明细、期末持仓和年度汇总；财务 CSV 包括月度汇总、年度汇总和收支明细。时间边界均包含在内，可以只填开始或结束时间。筛选不会丢失之前的交易成本或月份余额；历史持仓截至所选结束日期，历史行情价格与依赖它的市值／未实现盈亏留空。
 
+## 备份到 Google Drive
+
+在 **设置 → 本地数据** 点击 **备份到 Google Drive**。首次使用需要在 Google Cloud 项目中启用 Google Drive API，配置 Google Auth Platform 授权页面，再创建一个类型为 **桌面应用**的 OAuth 客户端。如果项目处于「测试」状态，请把要登录的 Google 账号加入测试用户列表。[启用 Drive API](https://developers.google.com/workspace/drive/api/quickstart/python?hl=zh-cn) · [创建 OAuth 凭据](https://developers.google.com/workspace/guides/create-credentials?hl=zh-cn#oauth-client-id)
+
+在账本中选择下载的 OAuth 客户端 JSON，再在浏览器打开的 Google 页面上登录并授权。账本申请按文件授权的 Drive 权限，把完整的 SQLite 快照上传到「我的云端硬盘」里的 **Stock Ledger Backups** 文件夹。每次备份都会生成一个带时间戳的 `.db` 文件。[Drive 权限说明](https://developers.google.com/workspace/drive/api/guides/api-specific-auth?hl=zh-cn)
+
+电脑支持安全凭据存储时，可保存授权以便下次一键备份。授权失效时 Google 会要求重新登录，处于「测试」状态的外部应用授权通常在七天后失效。请将 OAuth 客户端 JSON 保存在自己的电脑上。[Google OAuth 应用发布状态](https://developers.google.com/identity/protocols/oauth2/production-readiness/overview)
+
 ## 从源码运行
 
 需要 Node.js 24 LTS 和 Python 3.12+。Python 运行服务只使用标准库，无第三方 GUI 依赖。

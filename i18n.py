@@ -93,6 +93,7 @@ ZH: dict[str, str] = {
     "Turn on Live prices to see the chart": "打开实时报价即可查看图表",
     "Loading…": "加载中…",
     "No chart data": "没有图表数据",
+    "Only one price point is available": "仅有一个价格数据点",
     "No holdings": "没有持仓",
     "Couldn't load the chart (offline?)": "图表加载失败（是否离线？）",
     # ---- tabs and tables
